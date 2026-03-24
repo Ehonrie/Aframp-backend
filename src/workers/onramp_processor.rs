@@ -212,6 +212,13 @@ impl OnrampProcessor {
     async fn process_cycle(&self) -> Result<(), ProcessorError> {
         debug!("Starting onramp processor cycle");
 
+        let _timer = crate::metrics::worker::cycle_duration_seconds()
+            .with_label_values(&["onramp_processor"])
+            .start_timer();
+        crate::metrics::worker::cycles_total()
+            .with_label_values(&["onramp_processor"])
+            .inc();
+
         // Stage 1: Check for payment timeouts
         self.check_payment_timeouts().await?;
 
@@ -262,7 +269,7 @@ impl OnrampProcessor {
             .await?;
 
             // Emit metric
-            metrics::counter!("onramp_payments_failed_total", "reason" => "timeout").increment(1);
+            metrics::inc_payments_failed("timeout");
         }
 
         Ok(())
@@ -375,7 +382,7 @@ impl OnrampProcessor {
 
                         // Mark as completed
                         self.mark_transaction_completed(&tx.transaction_id, tx_hash).await?;
-                        metrics::counter!("onramp_cngn_transfers_confirmed_total").increment(1);
+                        metrics::inc_transfers_confirmed();
                     }
                 }
                 Err(e) => {
@@ -453,8 +460,7 @@ impl OnrampProcessor {
         .await?;
 
         info!(tx_id = %tx_id, "Transaction status updated to processing");
-        metrics::counter!("onramp_payments_confirmed_total", "provider" => provider.as_str())
-            .increment(1);
+        metrics::inc_payments_confirmed(provider.as_str());
 
         // Proceed to Stage 2: cNGN transfer
         self.execute_cngn_transfer(&tx).await?;
@@ -485,8 +491,7 @@ impl OnrampProcessor {
             .await?;
             self.initiate_refund(tx, FailureReason::TrustlineNotFound)
                 .await?;
-            metrics::counter!("onramp_cngn_transfers_failed_total", "reason" => "trustline_not_found")
-                .increment(1);
+            metrics::inc_transfers_failed("trustline_not_found");
             return Ok(());
         }
 
@@ -504,8 +509,7 @@ impl OnrampProcessor {
             .await?;
             self.initiate_refund(tx, FailureReason::InsufficientCngnBalance)
                 .await?;
-            metrics::counter!("onramp_cngn_transfers_failed_total", "reason" => "insufficient_balance")
-                .increment(1);
+            metrics::inc_transfers_failed("insufficient_balance");
             return Ok(());
         }
 
@@ -532,7 +536,7 @@ impl OnrampProcessor {
                 .execute((*self.db).as_ref())
                 .await?;
 
-                metrics::counter!("onramp_cngn_transfers_submitted_total").increment(1);
+                metrics::inc_transfers_submitted();
             }
             Err(e) => {
                 error!(
@@ -557,8 +561,7 @@ impl OnrampProcessor {
                         .await?;
                         self.initiate_refund(tx, FailureReason::StellarPermanentError)
                             .await?;
-                        metrics::counter!("onramp_cngn_transfers_failed_total", "reason" => "stellar_error")
-                            .increment(1);
+                        metrics::inc_transfers_failed("stellar_error");
                     }
                 }
             }
@@ -717,24 +720,62 @@ impl OnrampProcessor {
 
         // TODO: Call PaymentOrchestrator to initiate refund
         // For now, just log
-        metrics::counter!("onramp_refunds_initiated_total", "provider" => tx.payment_provider.as_deref().unwrap_or("unknown"))
-            .increment(1);
+        metrics::inc_refunds_initiated(tx.payment_provider.as_deref().unwrap_or("unknown"));
 
         Ok(())
     }
 }
 
 // ============================================================================
-// Metrics (placeholder - would use prometheus crate)
+// Metrics (real Prometheus counters via crate::metrics)
 // ============================================================================
 
 mod metrics {
-    pub fn counter(_name: &str, _labels: &str) -> Counter {
-        Counter
+    #[inline]
+    pub fn inc_payments_failed(reason: &str) {
+        crate::metrics::cngn::transactions_total()
+            .with_label_values(&["onramp", "failed"])
+            .inc();
+        crate::metrics::worker::errors_total()
+            .with_label_values(&["onramp_processor", reason])
+            .inc();
     }
 
-    pub struct Counter;
-    impl Counter {
-        pub fn increment(&self, _count: u64) {}
+    #[inline]
+    pub fn inc_payments_confirmed(provider: &str) {
+        crate::metrics::cngn::transactions_total()
+            .with_label_values(&["onramp", "completed"])
+            .inc();
+        let _ = provider; // label available on payment metrics
+    }
+
+    #[inline]
+    pub fn inc_transfers_submitted() {
+        crate::metrics::stellar::tx_submissions_total()
+            .with_label_values(&["success"])
+            .inc();
+    }
+
+    #[inline]
+    pub fn inc_transfers_confirmed() {
+        // already counted via cngn transactions_total completed
+    }
+
+    #[inline]
+    pub fn inc_transfers_failed(reason: &str) {
+        crate::metrics::stellar::tx_submissions_total()
+            .with_label_values(&["failed"])
+            .inc();
+        crate::metrics::worker::errors_total()
+            .with_label_values(&["onramp_processor", reason])
+            .inc();
+    }
+
+    #[inline]
+    pub fn inc_refunds_initiated(provider: &str) {
+        crate::metrics::cngn::transactions_total()
+            .with_label_values(&["onramp", "refunded"])
+            .inc();
+        let _ = provider;
     }
 }

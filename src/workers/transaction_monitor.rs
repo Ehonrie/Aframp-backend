@@ -176,6 +176,12 @@ impl TransactionMonitorWorker {
     }
 
     async fn run_cycle(&mut self) -> anyhow::Result<()> {
+        let _timer = crate::metrics::worker::cycle_duration_seconds()
+            .with_label_values(&["transaction_monitor"])
+            .start_timer();
+        crate::metrics::worker::cycles_total()
+            .with_label_values(&["transaction_monitor"])
+            .inc();
         self.process_pending_transactions().await?;
         self.scan_incoming_transactions().await?;
         Ok(())
