@@ -24,7 +24,8 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
-use cache::{init_cache_pool, CacheConfig, RedisCache};
+use cache::{init_cache_pool, build_multi_level_cache, CacheConfig, RedisCache};
+use cache::warmer::{warm_caches, WarmingState};
 use chains::stellar::client::StellarClient;
 use chains::stellar::config::StellarConfig;
 use database::{init_pool, PoolConfig};
@@ -342,8 +343,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize health checker
     info!("🏥 Initializing health checker...");
+    let warming_state = WarmingState::new();
     let health_checker =
-        HealthChecker::new(db_pool.clone(), redis_cache.clone(), stellar_client.clone());
+        HealthChecker::new(db_pool.clone(), redis_cache.clone(), stellar_client.clone())
+            .with_warming_state(warming_state.clone());
 
     // Spawn background task to update DB pool connection gauge every 15 seconds
     if let Some(pool) = db_pool.clone() {
@@ -359,8 +362,26 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+
     // Initialize notification service
     let notification_service = std::sync::Arc::new(services::notification::NotificationService::new());
+
+    // --- Cache warming (must complete before traffic is accepted) ---
+    if let (Some(ref pool), Some(ref redis)) = (&db_pool, &redis_cache) {
+        let registry = prometheus::default_registry();
+        let ml_cache = cache::build_multi_level_cache(redis.clone(), registry);
+        let rate_repo = database::exchange_rate_repository::ExchangeRateRepository::new(pool.clone());
+        let fee_repo = database::fee_structure_repository::FeeStructureRepository::new(pool.clone());
+        let ws = warming_state.clone();
+        let l1 = ml_cache.l1.clone();
+        let redis_clone = redis.clone();
+        tokio::spawn(async move {
+            warm_caches(&l1, &redis_clone, &rate_repo, &fee_repo, &ws).await;
+        });
+    } else {
+        // No DB or Redis — mark ready immediately so health check passes.
+        warming_state.mark_ready();
+    }
 
     // Initialize payment provider factory
     let provider_factory = if db_pool.is_some() {
@@ -805,7 +826,7 @@ async fn main() -> anyhow::Result<()> {
         info!("⏭️  Skipping fees routes (no database)");
         Router::new()
     };
-    
+
     // ── Batch transaction routes (Issue #125) ────────────────────────────────
     let batch_routes = if let Some(pool) = db_pool.clone() {
         let batch_state = api::batch::BatchState::new(std::sync::Arc::new(pool));
@@ -839,6 +860,22 @@ async fn main() -> anyhow::Result<()> {
 
     // ── OpenAPI / Swagger UI (Issue #114) ────────────────────────────────────
     let openapi_routes = api::openapi::openapi_routes();
+
+    // Setup transaction history routes
+    let history_routes = if let Some(pool) = db_pool.clone() {
+        let history_state = std::sync::Arc::new(api::transaction_history::TransactionHistoryState {
+            pool: std::sync::Arc::new(pool),
+            cache: redis_cache.clone().map(std::sync::Arc::new),
+        });
+        Router::new()
+            .route("/api/transactions", get(api::transaction_history::get_transaction_history))
+            .route("/api/transactions/export", get(api::transaction_history::export_transaction_history))
+            .with_state(history_state)
+    } else {
+        info!("⏭️  Skipping transaction history routes (no database)");
+        Router::new()
+    };
+
 
     let app = Router::new()
         .route("/", get(root))
@@ -884,11 +921,13 @@ async fn main() -> anyhow::Result<()> {
         .merge(batch_routes)
         .merge(admin_routes)
         .merge(openapi_routes)
+        .merge(history_routes)
         .with_state(AppState {
             db_pool,
             redis_cache,
             stellar_client,
             health_checker,
+            warming_state: Some(warming_state),
         })
         .layer(
             // ---------------------------------------------------------------
@@ -1012,6 +1051,7 @@ struct AppState {
     redis_cache: Option<RedisCache>,
     stellar_client: Option<StellarClient>,
     health_checker: HealthChecker,
+    warming_state: Option<WarmingState>,
 }
 
 // Handlers
