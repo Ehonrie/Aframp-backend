@@ -6,6 +6,8 @@ pub mod offramp;
 pub mod offramp_models;
 pub mod wallet;
 pub mod webhooks;
+pub mod transaction_history;
+pub mod recurring;
 pub mod auth;
 pub mod openapi;
 pub mod admin;
