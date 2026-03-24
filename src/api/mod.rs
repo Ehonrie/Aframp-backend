@@ -6,3 +6,5 @@ pub mod offramp;
 pub mod offramp_models;
 pub mod wallet;
 pub mod webhooks;
+pub mod transaction_history;
+pub mod recurring;

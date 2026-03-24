@@ -716,7 +716,22 @@ async fn main() -> anyhow::Result<()> {
         info!("⏭️  Skipping fees routes (no database)");
         Router::new()
     };
-    
+
+    // Setup transaction history routes
+    let history_routes = if let Some(pool) = db_pool.clone() {
+        let history_state = std::sync::Arc::new(api::transaction_history::TransactionHistoryState {
+            pool: std::sync::Arc::new(pool),
+            cache: redis_cache.clone().map(std::sync::Arc::new),
+        });
+        Router::new()
+            .route("/api/transactions", get(api::transaction_history::get_transaction_history))
+            .route("/api/transactions/export", get(api::transaction_history::export_transaction_history))
+            .with_state(history_state)
+    } else {
+        info!("⏭️  Skipping transaction history routes (no database)");
+        Router::new()
+    };
+
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
@@ -757,6 +772,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(rates_routes)
         .merge(fees_routes)
         .merge(webhook_routes)
+        .merge(history_routes)
         .with_state(AppState {
             db_pool,
             redis_cache,
