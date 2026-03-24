@@ -201,6 +201,19 @@ Integration tests (needs testnet):
 cargo test --features integration
 ```
 
+### Load Testing
+
+`k6` is the primary load testing tool for this project. Scenarios, thresholds, and CI usage are documented in `load-tests/README.md`.
+
+Quick run examples:
+
+```bash
+./load-tests/run.sh sustained
+./load-tests/run.sh spike
+./load-tests/run.sh stress
+./load-tests/run.sh soak
+```
+
 ## API Overview
 
 ### Wallet Operations

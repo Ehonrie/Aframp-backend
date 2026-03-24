@@ -17,6 +17,7 @@ pub struct TransactionMonitorWorker {
     pub http_client: reqwest::Client,
 pub mod maintenance;
 pub mod offramp_processor;
+pub mod stellar_confirmation_worker;
 pub mod onramp_processor;
 pub mod payment_poller;
 pub mod transaction_monitor;

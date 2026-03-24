@@ -26,7 +26,8 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
-use cache::{init_cache_pool, CacheConfig, RedisCache};
+use cache::{init_cache_pool, build_multi_level_cache, CacheConfig, RedisCache};
+use cache::warmer::{warm_caches, WarmingState};
 use chains::stellar::client::StellarClient;
 use chains::stellar::config::StellarConfig;
 use database::{init_pool, PoolConfig};
@@ -344,7 +345,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize health checker
     info!("🏥 Initializing health checker...");
+    let warming_state = WarmingState::new();
     let health_checker =
+        HealthChecker::new(db_pool.clone(), redis_cache.clone(), stellar_client.clone())
+            .with_warming_state(warming_state.clone());
         HealthChecker::new(db_pool.clone(), redis_cache.clone(), stellar_client.clone());
 
     // Spawn background task to update DB pool connection gauge every 15 seconds
@@ -361,8 +365,26 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+
     // Initialize notification service
     let notification_service = std::sync::Arc::new(services::notification::NotificationService::new());
+
+    // --- Cache warming (must complete before traffic is accepted) ---
+    if let (Some(ref pool), Some(ref redis)) = (&db_pool, &redis_cache) {
+        let registry = prometheus::default_registry();
+        let ml_cache = cache::build_multi_level_cache(redis.clone(), registry);
+        let rate_repo = database::exchange_rate_repository::ExchangeRateRepository::new(pool.clone());
+        let fee_repo = database::fee_structure_repository::FeeStructureRepository::new(pool.clone());
+        let ws = warming_state.clone();
+        let l1 = ml_cache.l1.clone();
+        let redis_clone = redis.clone();
+        tokio::spawn(async move {
+            warm_caches(&l1, &redis_clone, &rate_repo, &fee_repo, &ws).await;
+        });
+    } else {
+        // No DB or Redis — mark ready immediately so health check passes.
+        warming_state.mark_ready();
+    }
 
     // Initialize payment provider factory
     let provider_factory = if db_pool.is_some() {
@@ -441,6 +463,41 @@ async fn main() -> anyhow::Result<()> {
         info!("Offramp processor worker disabled (OFFRAMP_PROCESSOR_ENABLED=false)");
     }
 
+    // Start Stellar Confirmation Polling Worker
+    let stellar_confirm_enabled = std::env::var("STELLAR_CONFIRM_WORKER_ENABLED")
+        .unwrap_or_else(|_| "true".to_string())
+        .to_lowercase()
+        != "false";
+    if stellar_confirm_enabled {
+        if let (Some(pool), Some(client)) = (db_pool.clone(), stellar_client.clone()) {
+            let confirm_config =
+                workers::stellar_confirmation_worker::StellarConfirmationConfig::from_env();
+            let registry = prometheus::default_registry().clone();
+            match workers::stellar_confirmation_worker::WorkerMetrics::new(&registry) {
+                Ok(metrics) => {
+                    info!(
+                        poll_interval_secs = confirm_config.poll_interval.as_secs(),
+                        confirmation_threshold = confirm_config.confirmation_threshold,
+                        stale_timeout_secs = confirm_config.stale_timeout.as_secs(),
+                        "Starting Stellar confirmation polling worker"
+                    );
+                    let worker = workers::stellar_confirmation_worker::StellarConfirmationWorker::new(
+                        pool,
+                        client,
+                        confirm_config,
+                        std::sync::Arc::new(metrics),
+                    );
+                    tokio::spawn(worker.run(worker_shutdown_rx.clone()));
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to register Prometheus metrics for Stellar confirmation worker — skipping");
+                }
+            }
+        } else {
+            info!("Skipping Stellar confirmation worker (missing db pool or stellar client)");
+        }
+    } else {
+        info!("Stellar confirmation worker disabled (STELLAR_CONFIRM_WORKER_ENABLED=false)");
     // Start Onramp Processor Worker
     let onramp_enabled = std::env::var("ONRAMP_PROCESSOR_ENABLED")
         .unwrap_or_else(|_| "true".to_string())
@@ -913,6 +970,22 @@ async fn main() -> anyhow::Result<()> {
         info!("⏭️  Skipping fees routes (no database)");
         Router::new()
     };
+
+    // Setup transaction history routes
+    let history_routes = if let Some(pool) = db_pool.clone() {
+        let history_state = std::sync::Arc::new(api::transaction_history::TransactionHistoryState {
+            pool: std::sync::Arc::new(pool),
+            cache: redis_cache.clone().map(std::sync::Arc::new),
+        });
+        Router::new()
+            .route("/api/transactions", get(api::transaction_history::get_transaction_history))
+            .route("/api/transactions/export", get(api::transaction_history::export_transaction_history))
+            .with_state(history_state)
+    } else {
+        info!("⏭️  Skipping transaction history routes (no database)");
+        Router::new()
+    };
+
     // Setup auth routes
     let auth_routes = if let Some(cache) = redis_cache.clone() {
         let auth_state = api::auth::AuthState {
@@ -980,6 +1053,22 @@ async fn main() -> anyhow::Result<()> {
     // ── OpenAPI / Swagger UI (Issue #114) ────────────────────────────────────
     let openapi_routes = api::openapi::openapi_routes();
 
+    // Setup transaction history routes
+    let history_routes = if let Some(pool) = db_pool.clone() {
+        let history_state = std::sync::Arc::new(api::transaction_history::TransactionHistoryState {
+            pool: std::sync::Arc::new(pool),
+            cache: redis_cache.clone().map(std::sync::Arc::new),
+        });
+        Router::new()
+            .route("/api/transactions", get(api::transaction_history::get_transaction_history))
+            .route("/api/transactions/export", get(api::transaction_history::export_transaction_history))
+            .with_state(history_state)
+    } else {
+        info!("⏭️  Skipping transaction history routes (no database)");
+        Router::new()
+    };
+
+
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
@@ -1021,15 +1110,18 @@ async fn main() -> anyhow::Result<()> {
         .merge(rates_routes)
         .merge(fees_routes)
         .merge(webhook_routes)
+        .merge(history_routes)
         .merge(auth_routes)
         .merge(batch_routes)
         .merge(admin_routes)
         .merge(openapi_routes)
+        .merge(history_routes)
         .with_state(AppState {
             db_pool,
             redis_cache,
             stellar_client,
             health_checker,
+            warming_state: Some(warming_state),
         })
         .layer(
             // ---------------------------------------------------------------
@@ -1176,6 +1268,7 @@ struct AppState {
     redis_cache: Option<RedisCache>,
     stellar_client: Option<StellarClient>,
     health_checker: HealthChecker,
+    warming_state: Option<WarmingState>,
 }
 
 // Handlers
