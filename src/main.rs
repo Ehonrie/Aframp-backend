@@ -439,6 +439,41 @@ async fn main() -> anyhow::Result<()> {
         info!("Offramp processor worker disabled (OFFRAMP_PROCESSOR_ENABLED=false)");
     }
 
+    // Start Bill Processor Worker
+    let bill_processor_enabled = std::env::var("BILL_PROCESSOR_ENABLED")
+        .unwrap_or_else(|_| "true".to_string())
+        .to_lowercase() != "false";
+    let mut bill_processor_handle = None;
+    if bill_processor_enabled {
+        if let (Some(pool), Some(client)) = (db_pool.clone(), stellar_client.clone()) {
+            match workers::bill_processor::providers::BillProviderFactory::from_env() {
+                Ok(bill_provider_factory) => {
+                    let config = workers::bill_processor::worker::BillProcessorConfig::from_env();
+                    info!(
+                        poll_interval_secs = config.poll_interval.as_secs(),
+                        "Starting bill processor worker"
+                    );
+                    let worker = workers::bill_processor::worker::BillProcessorWorker::new(
+                        pool,
+                        client,
+                        Arc::new(bill_provider_factory),
+                        notification_service.clone(),
+                        config,
+                    );
+                    bill_processor_handle = Some(tokio::spawn(worker.run(worker_shutdown_rx.clone())));
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to create bill provider factory, skipping worker");
+                }
+            }
+        } else {
+            info!("Skipping bill processor worker (missing db pool or stellar client)");
+        }
+    } else {
+        info!("Bill processor worker disabled (BILL_PROCESSOR_ENABLED=false)");
+    }
+
+
     // Start Payment Poller Worker
     let poller_enabled = std::env::var("PAYMENT_POLLER_ENABLED")
         .unwrap_or_else(|_| "true".to_string())
