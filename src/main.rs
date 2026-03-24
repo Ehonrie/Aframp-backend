@@ -1165,10 +1165,21 @@ async fn main() -> anyhow::Result<()> {
     let app = if let Some(cache) = redis_cache.clone() {
 
         let rate_limit_state = crate::middleware::rate_limit::RateLimitState {
-            cache: std::sync::Arc::new(cache),
+            cache: std::sync::Arc::new(cache.clone()),
             config: rate_limit_config,
         };
-        app.layer(axum::middleware::from_fn_with_state(rate_limit_state, crate::middleware::rate_limit::rate_limit_middleware))
+
+        let replay_state = crate::middleware::replay_prevention::ReplayPreventionState {
+            redis: std::sync::Arc::new(cache.pool.clone()),
+            config: std::sync::Arc::new(crate::middleware::replay_prevention::ReplayConfig::from_env()),
+        };
+
+        app
+            .layer(axum::middleware::from_fn_with_state(
+                replay_state,
+                crate::middleware::replay_prevention::replay_prevention_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(rate_limit_state, crate::middleware::rate_limit::rate_limit_middleware))
     } else {
         app
     };
