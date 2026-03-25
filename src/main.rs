@@ -3,6 +3,7 @@ mod auth;
 mod cache;
 mod chains;
 mod config;
+mod config_validation;
 mod database;
 mod error;
 mod health;
@@ -105,6 +106,18 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("❌ Configuration validation failed: {}", e);
         anyhow::anyhow!("Configuration validation error: {}", e)
     })?;
+
+    // Production-grade startup validation — enforces TLS, secret hygiene,
+    // and environment-specific rules. Fatal in staging/production.
+    if let Err(e) = config_validation::validate_production_config() {
+        let app_env = std::env::var("APP_ENV").unwrap_or_else(|_| "development".into());
+        if app_env != "development" {
+            eprintln!("❌ {}", e);
+            std::process::exit(1);
+        } else {
+            eprintln!("⚠️  Config warnings (non-fatal in development):\n{}", e);
+        }
+    }
 
     // -------------------------------------------------------------------------
     // 2. Initialise OpenTelemetry tracer provider.   (Issue #104)
