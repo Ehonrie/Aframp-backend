@@ -73,6 +73,10 @@ pub mod workers;
 #[cfg(feature = "database")]
 pub mod recurring;
 
+// API key generation and issuance (Issue #131)
+#[cfg(feature = "database")]
+pub mod api_keys;
+
 // Prometheus metrics
 #[cfg(feature = "database")]
 pub mod metrics;
