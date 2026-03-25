@@ -12,3 +12,4 @@ pub mod auth;
 pub mod openapi;
 pub mod admin;
 pub mod batch;
+pub mod developer;

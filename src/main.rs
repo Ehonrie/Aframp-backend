@@ -1,4 +1,5 @@
 mod api;
+mod api_keys;
 mod auth;
 mod cache;
 mod chains;
@@ -1089,7 +1090,10 @@ async fn main() -> anyhow::Result<()> {
     // ── Admin scope management routes (Issue #132) ───────────────────────────
     let admin_routes = if let Some(pool) = db_pool.clone() {
         let scopes_state = api::admin::scopes::ScopesState {
-            db: std::sync::Arc::new(pool),
+            db: std::sync::Arc::new(pool.clone()),
+        };
+        let keys_state = api::admin::keys::AdminKeysState {
+            db: std::sync::Arc::new(pool.clone()),
         };
         Router::new()
             .route("/api/admin/scopes", get(api::admin::scopes::list_scopes))
@@ -1099,8 +1103,37 @@ async fn main() -> anyhow::Result<()> {
                     .patch(api::admin::scopes::update_key_scopes),
             )
             .with_state(scopes_state)
+            .merge(
+                Router::new()
+                    // Issue #131 — API key issuance
+                    .route(
+                        "/api/admin/consumers/{consumer_id}/keys",
+                        post(api::admin::keys::issue_key)
+                            .get(api::admin::keys::list_keys),
+                    )
+                    .route(
+                        "/api/admin/consumers/{consumer_id}/keys/{key_id}",
+                        delete(api::admin::keys::revoke_key),
+                    )
+                    .with_state(keys_state),
+            )
     } else {
         info!("Skipping admin routes (no database)");
+        Router::new()
+    };
+
+    // ── Developer self-service key routes (Issue #131) ───────────────────────
+    let developer_routes = if let Some(pool) = db_pool.clone() {
+        let dev_state = api::developer::keys::DeveloperKeysState {
+            db: std::sync::Arc::new(pool),
+        };
+        Router::new()
+            .route("/api/developer/keys", post(api::developer::keys::issue_key))
+            .route("/api/developer/keys", get(api::developer::keys::list_keys))
+            .route("/api/developer/keys/{key_id}", delete(api::developer::keys::revoke_key))
+            .with_state(dev_state)
+    } else {
+        info!("Skipping developer routes (no database)");
         Router::new()
     };
 
@@ -1170,6 +1203,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(admin_routes)
         .merge(openapi_routes)
         .merge(recurring_routes)
+        .merge(developer_routes)
         .merge(history_routes)
         .with_state(AppState {
             db_pool,
