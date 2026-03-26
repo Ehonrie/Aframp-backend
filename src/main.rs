@@ -1114,6 +1114,41 @@ async fn main() -> anyhow::Result<()> {
         info!("Recurring payment worker disabled (RECURRING_WORKER_ENABLED=false)");
     }
 
+    // ── IP Detection Worker (Issue #166) ─────────────────────────────────────
+    let ip_detection_worker_enabled = std::env::var("IP_DETECTION_WORKER_ENABLED")
+        .unwrap_or_else(|_| "true".to_string())
+        .to_lowercase()
+        != "false";
+    if ip_detection_worker_enabled {
+        if let (Some(pool), Some(cache)) = (db_pool.clone(), redis_cache.clone()) {
+            let detection_service = std::sync::Arc::new(
+                crate::services::ip_detection::IpDetectionService::new(
+                    database::ip_reputation_repository::IpReputationRepository::new(pool),
+                    std::sync::Arc::new(cache),
+                    Default::default(),
+                )
+            );
+
+            // Bootstrap blocked IPs cache on startup
+            if let Err(e) = detection_service.bootstrap_blocked_ips_cache().await {
+                error!(error = %e, "Failed to bootstrap blocked IPs cache");
+            }
+
+            let worker_config = workers::ip_detection_worker::IpDetectionWorkerConfig::from_env();
+            let worker = workers::ip_detection_worker::IpDetectionWorker::new(
+                database::ip_reputation_repository::IpReputationRepository::new(db_pool.clone().unwrap()),
+                detection_service,
+                worker_config,
+            );
+            tokio::spawn(worker.run(worker_shutdown_rx.clone()));
+            info!("✅ IP detection worker started");
+        } else {
+            info!("Skipping IP detection worker (missing database or cache)");
+        }
+    } else {
+        info!("IP detection worker disabled (IP_DETECTION_WORKER_ENABLED=false)");
+    }
+
     // ── Batch transaction routes (Issue #125) ────────────────────────────────
     let batch_routes = if let Some(pool) = db_pool.clone() {
         let batch_state = api::batch::BatchState::new(std::sync::Arc::new(pool));
@@ -1157,6 +1192,10 @@ async fn main() -> anyhow::Result<()> {
         let keys_state = api::admin::keys::AdminKeysState {
             db: std::sync::Arc::new(pool.clone()),
         };
+        let ip_reputation_state = api::admin::ip_reputation::IpReputationState {
+            repo: database::ip_reputation_repository::IpReputationRepository::new(pool.clone()),
+        };
+        Router::new()
 
         // ── Revocation & Blacklist routes (Issue #138) ────────────────────────
         let revocation_state = if let Some(ref redis) = redis_cache {
@@ -1198,6 +1237,31 @@ async fn main() -> anyhow::Result<()> {
                         delete(api::admin::keys::revoke_key),
                     )
                     .with_state(keys_state),
+            )
+            .merge(
+                Router::new()
+                    // Issue #166 — IP reputation management
+                    .route(
+                        "/api/admin/ip-reputation",
+                        get(api::admin::ip_reputation::list_flagged_ips),
+                    )
+                    .route(
+                        "/api/admin/ip-reputation/{ip}",
+                        get(api::admin::ip_reputation::get_ip_reputation),
+                    )
+                    .route(
+                        "/api/admin/ip-reputation/{ip}/block",
+                        post(api::admin::ip_reputation::block_ip),
+                    )
+                    .route(
+                        "/api/admin/ip-reputation/{ip}/unblock",
+                        post(api::admin::ip_reputation::unblock_ip),
+                    )
+                    .route(
+                        "/api/admin/ip-reputation/{ip}/whitelist",
+                        post(api::admin::ip_reputation::whitelist_ip),
+                    )
+                    .with_state(ip_reputation_state),
             )
     } else {
         info!("Skipping admin routes (no database)");
@@ -1332,6 +1396,54 @@ async fn main() -> anyhow::Result<()> {
         .merge(key_rotation_routes)
         .merge(openapi_routes)
         .merge(recurring_routes)
+    let app = Router::new()
+        .route("/", get(root))
+        .route("/health", get(health))
+        .route("/health/ready", get(readiness))
+        .route("/health/live", get(liveness))
+        .route("/metrics", get(metrics::handler::metrics_handler))
+        .route("/api/stellar/account/{address}", get(get_stellar_account))
+        .route(
+            "/api/trustlines/operations",
+            post(create_trustline_operation),
+        )
+        .route(
+            "/api/trustlines/operations/{id}",
+            patch(update_trustline_operation_status),
+        )
+        .route(
+            "/api/trustlines/operations/wallet/{address}",
+            get(list_trustline_operations_by_wallet),
+        )
+        .route("/api/fees/calculate", post(calculate_fee))
+        .route("/api/cngn/trustlines/check", post(check_cngn_trustline))
+        .route(
+            "/api/cngn/trustlines/preflight",
+            post(preflight_cngn_trustline),
+        )
+        .route("/api/cngn/trustlines/build", post(build_cngn_trustline))
+        .route("/api/cngn/trustlines/submit", post(submit_cngn_trustline))
+        .route(
+            "/api/cngn/trustlines/retry/{id}",
+            post(retry_cngn_trustline),
+        )
+        .route("/api/cngn/payments/build", post(build_cngn_payment))
+        .route("/api/cngn/payments/sign", post(sign_cngn_payment))
+        .route("/api/cngn/payments/submit", post(submit_cngn_payment))
+        .route("/api/payments/initiate", post(initiate_payment))
+        .merge(onramp_routes)
+        .merge(offramp_routes)
+        .merge(wallet_routes)
+        .merge(rates_routes)
+        .merge(fees_routes)
+        .merge(webhook_routes)
+        .merge(history_routes)
+        .merge(auth_routes)
+        .merge(batch_routes)
+        .merge(admin_routes)
+        .merge(key_rotation_routes)
+        .merge(openapi_routes)
+        .merge(recurring_routes)
         .merge(developer_routes)
         .merge(oauth_routes)
         .merge(history_routes)
@@ -1343,6 +1455,36 @@ async fn main() -> anyhow::Result<()> {
             stellar_client,
             health_checker,
             warming_state: Some(warming_state),
+        });
+
+    // Apply middleware conditionally based on available services
+    let app = if let (Some(db_pool), Some(redis_cache)) = (db_pool.clone(), redis_cache.clone()) {
+        let ip_blocking_state = crate::middleware::ip_blocking::IpBlockingState {
+            detection_service: std::sync::Arc::new(
+                crate::services::ip_detection::IpDetectionService::new(
+                    database::ip_reputation_repository::IpReputationRepository::new(db_pool),
+                    std::sync::Arc::new(redis_cache.clone()),
+                    Default::default(),
+                )
+            ),
+        };
+
+        app.layer(
+            ServiceBuilder::new()
+                .layer(SetRequestIdLayer::x_request_id(UuidRequestId))
+                .layer(axum::middleware::from_fn(
+                    crate::telemetry::middleware::tracing_middleware,
+                ))
+                .layer(axum::middleware::from_fn_with_state(
+                    ip_blocking_state,
+                    crate::middleware::ip_blocking::ip_blocking_middleware,
+                ))
+                .layer(axum::middleware::from_fn(metrics_middleware))
+                .layer(axum::middleware::from_fn(request_logging_middleware))
+                .layer(PropagateRequestIdLayer::x_request_id()),
+        )
+    } else {
+        app.layer(
         })
         .layer(
             // ---------------------------------------------------------------
@@ -1372,12 +1514,13 @@ async fn main() -> anyhow::Result<()> {
                 .layer(axum::middleware::from_fn(security_headers_middleware))
                 .layer(SetRequestIdLayer::x_request_id(UuidRequestId))
                 .layer(axum::middleware::from_fn(
-                    crate::telemetry::middleware::tracing_middleware,  // Issue #104
+                    crate::telemetry::middleware::tracing_middleware,
                 ))
                 .layer(axum::middleware::from_fn(metrics_middleware))
                 .layer(axum::middleware::from_fn(request_logging_middleware))
                 .layer(PropagateRequestIdLayer::x_request_id()),
-        );
+        )
+    };
 
     let rate_limit_config = std::sync::Arc::new(crate::middleware::rate_limit::RateLimitConfig::load("rate_limits.yaml").unwrap_or_else(|e| {
         tracing::warn!("Failed to load rate_limits.yaml, using defaults: {}", e);
