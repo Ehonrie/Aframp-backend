@@ -49,6 +49,10 @@ pub mod payments;
 #[cfg(feature = "database")]
 pub mod config;
 
+// Admin access control system
+#[cfg(feature = "database")]
+pub mod admin;
+
 // API handlers (exposed for integration tests)
 #[cfg(feature = "database")]
 pub mod api;
