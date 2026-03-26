@@ -833,7 +833,7 @@ async fn main() -> anyhow::Result<()> {
         Router::new()
             .route("/api/onramp/quote", post(create_onramp_quote))
             .with_state(quote_service)
-            .route("/api/onramp/status/tx_id", get(api::onramp::get_onramp_status))
+            .route("/api/onramp/status/:tx_id", get(api::onramp::get_onramp_status))
             .with_state(status_service)
             .route(
                 "/api/onramp/initiate",
