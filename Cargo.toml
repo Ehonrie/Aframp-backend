@@ -20,11 +20,36 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["database", "cache"]
 integration = []
-database = [ "dep:tokio", "dep:async-trait", "dep:uuid", "dep:chrono", "dep:serde", "dep:serde_json", "dep:tracing", "dep:tracing-subscriber", "dep:axum", "dep:tower", "dep:tower-http", "dep:regex", "dep:http", "dep:sqlx", "dep:hmac", "dep:sha2", "dep:hex", "dep:bigdecimal", "dep:rust_decimal", "dep:stellar-strkey", "dep:ed25519-dalek", "dep:stellar-xdr", "dep:utoipa", "dep:utoipa-swagger-ui", "dep:jsonwebtoken" ]
+database = [ 
+    "dep:tokio", 
+    "dep:async-trait", 
+    "dep:uuid", 
+    "dep:chrono", 
+    "dep:serde", 
+    "dep:serde_json", 
+    "dep:tracing", 
+    "dep:tracing-subscriber", 
+    "dep:axum", 
+    "dep:tower", 
+    "dep:tower-http", 
+    "dep:regex", 
+    "dep:http", 
+    "dep:sqlx", 
+    "dep:hmac", 
+    "dep:sha2", 
+    "dep:hex", 
+    "dep:bigdecimal", 
+    "dep:rust_decimal", 
+    "dep:stellar-strkey", 
+    "dep:ed25519-dalek", 
+    "dep:stellar-xdr", 
+    "dep:utoipa", 
+    "dep:utoipa-swagger-ui", 
+    "dep:jsonwebtoken",
+    "dep:argon2", 
+    "dep:rand"
+]
 cache = ["dep:redis", "dep:bb8", "dep:bb8-redis", "dep:moka", "dep:prometheus", "dep:tokio-util", "database"]
-database = [ "dep:tokio", "dep:async-trait", "dep:uuid", "dep:chrono", "dep:serde", "dep:serde_json", "dep:tracing", "dep:tracing-subscriber", "dep:axum", "dep:tower", "dep:tower-http", "dep:regex", "dep:http", "dep:sqlx", "dep:hmac", "dep:sha2", "dep:hex", "dep:bigdecimal", "dep:rust_decimal", "dep:stellar-strkey", "dep:ed25519-dalek", "dep:stellar-xdr", "dep:jsonwebtoken" ]
-database = [ "dep:tokio", "dep:async-trait", "dep:uuid", "dep:chrono", "dep:serde", "dep:serde_json", "dep:tracing", "dep:tracing-subscriber", "dep:axum", "dep:tower", "dep:tower-http", "dep:regex", "dep:http", "dep:sqlx", "dep:hmac", "dep:sha2", "dep:hex", "dep:bigdecimal", "dep:rust_decimal", "dep:stellar-strkey", "dep:ed25519-dalek", "dep:stellar-xdr", "dep:utoipa", "dep:utoipa-swagger-ui", "dep:argon2", "dep:rand" ]
-cache = ["dep:redis", "dep:bb8", "dep:bb8-redis", "dep:moka", "dep:tokio-util", "database"]
 
 # Distributed tracing via OpenTelemetry (Issue #104).
 # Enables OTLP export to Jaeger / Grafana Tempo, W3C trace-context propagation,
@@ -69,11 +94,7 @@ serde      = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0",                        optional = true }
 
 # --- Database ---
-sqlx = {
-    version  = "0.8.6",
-    features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "bigdecimal"],
-    optional = true,
-}
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "bigdecimal"], optional = true }
 
 # In-process L1 cache
 moka = { version = "0.12", features = ["future"], optional = true }

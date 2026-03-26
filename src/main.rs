@@ -38,6 +38,8 @@ use database::{init_pool, PoolConfig};
 use dotenv::dotenv;
 use middleware::logging::{request_logging_middleware, UuidRequestId};
 use middleware::metrics::metrics_middleware;
+use middleware::cors::{cors_middleware, CorsConfig};
+use middleware::security::security_headers_middleware;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -1305,11 +1307,13 @@ async fn main() -> anyhow::Result<()> {
             // last on the way out.
             //
             // Order (outermost → innermost, i.e. the order added here):
-            //   1. SetRequestIdLayer       — assigns x-request-id UUID
-            //   2. tracing_middleware      — extracts W3C traceparent, opens
+            //   1. CORS middleware         — handles cross-origin requests
+            //   2. Security headers        — adds security headers to responses
+            //   3. SetRequestIdLayer       — assigns x-request-id UUID
+            //   4. tracing_middleware      — extracts W3C traceparent, opens
             //                               root span per request (Issue #104)
-            //   3. request_logging_middleware — structured access log line
-            //   4. PropagateRequestIdLayer — copies x-request-id to response
+            //   5. request_logging_middleware — structured access log line
+            //   6. PropagateRequestIdLayer — copies x-request-id to response
             //
             // The tracing middleware is inserted between SetRequestId and the
             // existing request_logging_middleware so:
@@ -1318,6 +1322,11 @@ async fn main() -> anyhow::Result<()> {
             //     trace_id / span_id in its JSON output.
             // ---------------------------------------------------------------
             ServiceBuilder::new()
+                .layer(axum::middleware::from_fn_with_state(
+                    CorsConfig::from_env(),
+                    cors_middleware,
+                ))
+                .layer(axum::middleware::from_fn(security_headers_middleware))
                 .layer(SetRequestIdLayer::x_request_id(UuidRequestId))
                 .layer(axum::middleware::from_fn(
                     crate::telemetry::middleware::tracing_middleware,  // Issue #104

@@ -21,3 +21,7 @@ pub mod request_integrity;
 pub mod hmac_signing;
 #[cfg(feature = "database")]
 pub mod replay_prevention;
+
+// Security middleware
+pub mod cors;
+pub mod security;
