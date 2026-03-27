@@ -16,6 +16,7 @@ mod metrics;
 mod middleware;
 mod oauth;
 mod payments;
+mod pentest;
 mod recurring;
 mod services;
 mod telemetry;
@@ -1356,6 +1357,39 @@ async fn main() -> anyhow::Result<()> {
     // ── OpenAPI / Swagger UI (Issue #114) ────────────────────────────────────
     let openapi_routes = api::openapi::openapi_routes();
 
+    // ── Pentest & Security Review Framework ──────────────────────────────────
+    let pentest_routes = if let Some(pool) = db_pool.clone() {
+        let repo = std::sync::Arc::new(pentest::PentestRepository::new(pool));
+        let svc = std::sync::Arc::new(pentest::PentestService::new(repo));
+        // Spawn safety backstop task — auto-deactivates expired pentest windows
+        {
+            let svc_clone = svc.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    ticker.tick().await;
+                    let _ = svc_clone.run_safety_backstop().await;
+                }
+            });
+        }
+        // Spawn SLA breach alert task — fires every 15 minutes
+        {
+            let svc_clone = svc.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(900));
+                loop {
+                    ticker.tick().await;
+                    let _ = svc_clone.check_sla_breaches().await;
+                }
+            });
+        }
+        info!("🔒 Pentest & security review framework routes enabled");
+        pentest::pentest_routes(svc)
+    } else {
+        info!("⏭️  Skipping pentest routes (no database)");
+        Router::new()
+    };
+
     // Setup OAuth 2.0 routes
     let oauth_routes = if let (Some(pool), Some(cache)) = (db_pool.clone(), redis_cache.clone()) {
         match oauth::RsaKeyPair::from_env() {
@@ -1485,6 +1519,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(oauth_routes)
         .merge(history_routes)
         .merge(ddos_admin_routes)
+        .merge(pentest_routes)
         .merge(developer_portal::routes::register_developer_portal_routes(Router::new(), db_pool.clone()))
         .with_state(AppState {
             db_pool,
