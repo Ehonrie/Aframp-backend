@@ -38,9 +38,6 @@ pub mod cache;
 #[cfg(feature = "database")]
 pub mod services;
 
-#[cfg(feature = "database")]
-pub mod recurring;
-
 // Payment providers
 #[cfg(feature = "database")]
 pub mod payments;
@@ -98,6 +95,13 @@ pub mod metrics;
 #[cfg(feature = "cache")]
 pub mod ddos;
 
+// End-to-end payload encryption (Issue — Data Security & Encryption)
+#[cfg(feature = "database")]
+pub mod crypto;
+
+// Platform key management framework (Issue — Key Management & Rotation)
+#[cfg(feature = "database")]
+pub mod key_management;
 // Penetration testing & security review framework
 #[cfg(feature = "database")]
 pub mod pentest;
