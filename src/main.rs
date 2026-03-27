@@ -1,5 +1,6 @@
 mod api;
 mod api_keys;
+mod audit;
 mod auth;
 mod cache;
 mod chains;
@@ -16,6 +17,7 @@ mod middleware;
 mod mtls;
 mod oauth;
 mod payments;
+mod pentest;
 mod recurring;
 mod services;
 mod telemetry;
@@ -387,6 +389,28 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize notification service
     let notification_service = std::sync::Arc::new(services::notification::NotificationService::new());
+
+    // ── Audit logging system (Issue #183) ─────────────────────────────────────
+    let audit_writer = if let (Some(ref pool), Some(ref redis_pool)) = (&db_pool, &redis_cache) {
+        let audit_repo = std::sync::Arc::new(audit::repository::AuditLogRepository::new(pool.clone()));
+        let audit_streamer = std::sync::Arc::new(audit::streaming::AuditStreamer::new(redis_pool.pool.clone()));
+        let buffer_size: usize = std::env::var("AUDIT_WRITER_BUFFER_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        let (writer, rx) = audit::writer::AuditWriter::new(
+            audit_repo.clone(),
+            audit_streamer.clone(),
+            Some(buffer_size),
+        );
+        let writer = std::sync::Arc::new(writer);
+        tokio::spawn(audit::writer::run_writer_task(audit_repo, audit_streamer, rx));
+        info!("✅ Audit logging writer started (buffer={})", buffer_size);
+        Some(writer)
+    } else {
+        info!("⏭️  Skipping audit writer (no database/redis)");
+        None
+    };
 
     // --- Cache warming (must complete before traffic is accepted) ---
     if let (Some(ref pool), Some(ref redis)) = (&db_pool, &redis_cache) {
@@ -1362,6 +1386,20 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ── DDoS protection state and admin routes ────────────────────────────────
+    // ── Audit log query routes (Issue #183) ──────────────────────────────────
+    let audit_routes = if let Some(ref pool) = db_pool {
+        let audit_handler_state = std::sync::Arc::new(audit::handlers::AuditHandlerState {
+            repo: std::sync::Arc::new(audit::repository::AuditLogRepository::new(pool.clone())),
+        });
+        Router::new()
+            .route("/api/admin/audit/logs", get(audit::handlers::list_audit_logs))
+            .route("/api/admin/audit/logs/export", get(audit::handlers::export_audit_logs))
+            .route("/api/admin/audit/logs/verify", get(audit::handlers::verify_hash_chain))
+            .route("/api/admin/audit/logs/:entry_id", get(audit::handlers::get_audit_log_entry))
+            .with_state(audit_handler_state)
+    } else {
+        Router::new()
+    };
     let (ddos_state, ddos_admin_routes) = if let Some(ref cache) = redis_cache {
         let ddos_config = ddos::config::DdosConfig::from_env();
         let state = std::sync::Arc::new(ddos::state::DdosState::new(ddos_config, cache.clone()));
@@ -1412,6 +1450,39 @@ async fn main() -> anyhow::Result<()> {
 
     // ── OpenAPI / Swagger UI (Issue #114) ────────────────────────────────────
     let openapi_routes = api::openapi::openapi_routes();
+
+    // ── Pentest & Security Review Framework ──────────────────────────────────
+    let pentest_routes = if let Some(pool) = db_pool.clone() {
+        let repo = std::sync::Arc::new(pentest::PentestRepository::new(pool));
+        let svc = std::sync::Arc::new(pentest::PentestService::new(repo));
+        // Spawn safety backstop task — auto-deactivates expired pentest windows
+        {
+            let svc_clone = svc.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    ticker.tick().await;
+                    let _ = svc_clone.run_safety_backstop().await;
+                }
+            });
+        }
+        // Spawn SLA breach alert task — fires every 15 minutes
+        {
+            let svc_clone = svc.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(900));
+                loop {
+                    ticker.tick().await;
+                    let _ = svc_clone.check_sla_breaches().await;
+                }
+            });
+        }
+        info!("🔒 Pentest & security review framework routes enabled");
+        pentest::pentest_routes(svc)
+    } else {
+        info!("⏭️  Skipping pentest routes (no database)");
+        Router::new()
+    };
 
     // Setup OAuth 2.0 routes
     let oauth_routes = if let (Some(pool), Some(cache)) = (db_pool.clone(), redis_cache.clone()) {
@@ -1534,6 +1605,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(auth_routes)
         .merge(batch_routes)
         .merge(admin_routes)
+        .merge(audit_routes)
         .merge(key_rotation_routes)
         .merge(openapi_routes)
         .merge(recurring_routes)
@@ -1541,6 +1613,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(oauth_routes)
         .merge(history_routes)
         .merge(ddos_admin_routes)
+        .merge(pentest_routes)
         .merge(developer_portal::routes::register_developer_portal_routes(Router::new(), db_pool.clone()))
         .merge(Router::new().nest("/api/admin/security", mtls_admin_routes))
         .with_state(AppState {
@@ -1577,9 +1650,6 @@ async fn main() -> anyhow::Result<()> {
                 .layer(axum::middleware::from_fn(request_logging_middleware))
                 .layer(PropagateRequestIdLayer::x_request_id()),
         )
-    } else {
-        app.layer(
-        })
         .layer(
             // ---------------------------------------------------------------
             // Middleware stack — innermost layer runs first on the way in,
@@ -1661,6 +1731,14 @@ async fn main() -> anyhow::Result<()> {
 
 
     info!("✅ Routes configured");
+
+    // Inject audit writer as an Axum extension so the middleware can access it
+    let app = if let Some(ref writer) = audit_writer {
+        app.layer(axum::Extension(writer.clone()))
+            .layer(axum::middleware::from_fn(audit::middleware::audit_middleware))
+    } else {
+        app
+    };
 
     // Run the server with graceful shutdown
     let addr: SocketAddr = format!("{}:{}", server_host, server_port).parse()?;
