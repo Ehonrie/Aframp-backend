@@ -1,5 +1,6 @@
 mod api;
 mod api_keys;
+mod audit;
 mod auth;
 mod cache;
 mod chains;
@@ -387,6 +388,28 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize notification service
     let notification_service = std::sync::Arc::new(services::notification::NotificationService::new());
+
+    // ── Audit logging system (Issue #183) ─────────────────────────────────────
+    let audit_writer = if let (Some(ref pool), Some(ref redis_pool)) = (&db_pool, &redis_cache) {
+        let audit_repo = std::sync::Arc::new(audit::repository::AuditLogRepository::new(pool.clone()));
+        let audit_streamer = std::sync::Arc::new(audit::streaming::AuditStreamer::new(redis_pool.pool.clone()));
+        let buffer_size: usize = std::env::var("AUDIT_WRITER_BUFFER_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        let (writer, rx) = audit::writer::AuditWriter::new(
+            audit_repo.clone(),
+            audit_streamer.clone(),
+            Some(buffer_size),
+        );
+        let writer = std::sync::Arc::new(writer);
+        tokio::spawn(audit::writer::run_writer_task(audit_repo, audit_streamer, rx));
+        info!("✅ Audit logging writer started (buffer={})", buffer_size);
+        Some(writer)
+    } else {
+        info!("⏭️  Skipping audit writer (no database/redis)");
+        None
+    };
 
     // --- Cache warming (must complete before traffic is accepted) ---
     if let (Some(ref pool), Some(ref redis)) = (&db_pool, &redis_cache) {
@@ -1269,7 +1292,20 @@ async fn main() -> anyhow::Result<()> {
         Router::new()
     };
 
-    // ── DDoS protection state and admin routes ────────────────────────────────
+    // ── Audit log query routes (Issue #183) ──────────────────────────────────
+    let audit_routes = if let Some(ref pool) = db_pool {
+        let audit_handler_state = std::sync::Arc::new(audit::handlers::AuditHandlerState {
+            repo: std::sync::Arc::new(audit::repository::AuditLogRepository::new(pool.clone())),
+        });
+        Router::new()
+            .route("/api/admin/audit/logs", get(audit::handlers::list_audit_logs))
+            .route("/api/admin/audit/logs/export", get(audit::handlers::export_audit_logs))
+            .route("/api/admin/audit/logs/verify", get(audit::handlers::verify_hash_chain))
+            .route("/api/admin/audit/logs/:entry_id", get(audit::handlers::get_audit_log_entry))
+            .with_state(audit_handler_state)
+    } else {
+        Router::new()
+    };
     let (ddos_state, ddos_admin_routes) = if let Some(ref cache) = redis_cache {
         let ddos_config = ddos::config::DdosConfig::from_env();
         let state = std::sync::Arc::new(ddos::state::DdosState::new(ddos_config, cache.clone()));
@@ -1475,6 +1511,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(auth_routes)
         .merge(batch_routes)
         .merge(admin_routes)
+        .merge(audit_routes)
         .merge(key_rotation_routes)
         .merge(openapi_routes)
         .merge(recurring_routes)
@@ -1518,9 +1555,6 @@ async fn main() -> anyhow::Result<()> {
                 .layer(axum::middleware::from_fn(request_logging_middleware))
                 .layer(PropagateRequestIdLayer::x_request_id()),
         )
-    } else {
-        app.layer(
-        })
         .layer(
             // ---------------------------------------------------------------
             // Middleware stack — innermost layer runs first on the way in,
@@ -1602,6 +1636,14 @@ async fn main() -> anyhow::Result<()> {
 
 
     info!("✅ Routes configured");
+
+    // Inject audit writer as an Axum extension so the middleware can access it
+    let app = if let Some(ref writer) = audit_writer {
+        app.layer(axum::Extension(writer.clone()))
+            .layer(axum::middleware::from_fn(audit::middleware::audit_middleware))
+    } else {
+        app
+    };
 
     // Run the server with graceful shutdown
     let addr: SocketAddr = format!("{}:{}", server_host, server_port).parse()?;

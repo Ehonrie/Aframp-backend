@@ -733,7 +733,12 @@ fn register_all(r: &Registry) {
     ip_detection::register(r);
     crate::ddos::metrics::register(r);
     crate::pentest::metrics::register(r);
+<<<<<<< feature/data-masking-redaction
     crate::masking::metrics::register(r);
+=======
+    #[cfg(feature = "database")]
+    crate::audit::metrics::register(r);
+>>>>>>> master
 }
 
 // ---------------------------------------------------------------------------
