@@ -57,6 +57,11 @@ pub mod config;
 #[cfg(feature = "database")]
 pub mod admin;
 
+// Data classification framework — authoritative sensitivity taxonomy and
+// policy enforcement for every data field on the platform.
+#[cfg(feature = "database")]
+pub mod data_classification;
+
 // API handlers (exposed for integration tests)
 #[cfg(feature = "database")]
 pub mod api;
