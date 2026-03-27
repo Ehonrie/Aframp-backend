@@ -97,6 +97,10 @@ pub mod ddos;
 #[cfg(feature = "database")]
 pub mod pentest;
 
+// Data masking & redaction system
+#[cfg(feature = "database")]
+pub mod masking;
+
 // Contract error enum for Soroban (only when not using database feature)
 #[cfg(not(feature = "database"))]
 #[contracterror]
