@@ -1560,6 +1560,19 @@ async fn main() -> anyhow::Result<()> {
         .merge(key_rotation_routes)
         .merge(openapi_routes)
         .merge(recurring_routes)
+    // ── Transparency Portal (Issue #239) ─────────────────────────────────────
+    let transparency_routes = if let Some(pool) = db_pool.clone() {
+        let signing_key = api::transparency::load_signing_key();
+        let state = std::sync::Arc::new(api::transparency::TransparencyState {
+            db: pool,
+            signing_key,
+        });
+        info!("🔍 Transparency portal routes enabled");
+        api::transparency::transparency_routes(state)
+    } else {
+        info!("⏭️  Skipping transparency routes (no database)");
+        Router::new()
+    };
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
@@ -1616,6 +1629,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(pentest_routes)
         .merge(developer_portal::routes::register_developer_portal_routes(Router::new(), db_pool.clone()))
         .merge(Router::new().nest("/api/admin/security", mtls_admin_routes))
+        .merge(transparency_routes)
         .with_state(AppState {
             db_pool,
             redis_cache,
