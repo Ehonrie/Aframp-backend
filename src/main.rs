@@ -1,6 +1,7 @@
 mod adaptive_rate_limit;
 mod api;
 mod api_keys;
+mod analytics;
 mod audit;
 mod auth;
 mod cache;
@@ -1471,6 +1472,30 @@ async fn main() -> anyhow::Result<()> {
             .merge(api::key_rotation::admin_rotation_router(rotation_state))
     } else {
         info!("Skipping key rotation routes (no database)");
+        Router::new()
+    };
+
+    // ── Consumer usage analytics worker ──────────────────────────────────────
+    let analytics_routes = if let Some(pool) = db_pool.clone() {
+        let analytics_config = analytics::worker::AnalyticsWorkerConfig::default();
+        let analytics_worker = analytics::worker::AnalyticsWorker::new(
+            std::sync::Arc::new(pool.clone()),
+            analytics_config,
+        );
+        tokio::spawn(analytics_worker.run(worker_shutdown_rx.clone()));
+        info!("✅ Analytics worker started");
+        
+        // Create analytics routes
+        let analytics_repo = std::sync::Arc::new(analytics::repository::AnalyticsRepository::new(pool));
+        Router::new()
+            .nest("/api/developer", analytics::routes::consumer_analytics_routes())
+            .nest("/api/admin/analytics", analytics::routes::admin_analytics_routes())
+            .with_state(analytics_repo)
+    } else {
+        info!("Skipping analytics worker (no database)");
+        Router::new()
+    };
+
     // ── Developer self-service key routes (Issue #131) ───────────────────────
     let developer_routes = if let Some(pool) = db_pool.clone() {
         let dev_state = api::developer::keys::DeveloperKeysState {
@@ -1646,6 +1671,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(adaptive_rl_admin_routes)
         .merge(audit_routes)
         .merge(key_rotation_routes)
+        .merge(analytics_routes)
         .merge(openapi_routes)
         .merge(recurring_routes)
         .merge(developer_routes)

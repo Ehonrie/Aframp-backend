@@ -119,6 +119,9 @@ pub mod masking;
 #[cfg(feature = "database")]
 pub mod gateway;
 
+// Consumer usage analytics & reporting system
+#[cfg(feature = "database")]
+pub mod analytics;
 // Adaptive rate limiting and throttling system
 #[cfg(feature = "cache")]
 pub mod adaptive_rate_limit;
