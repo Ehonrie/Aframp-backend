@@ -541,6 +541,8 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         info!("Stellar confirmation worker disabled (STELLAR_CONFIRM_WORKER_ENABLED=false)");
+    }
+
     // Start Onramp Processor Worker
     let onramp_enabled = std::env::var("ONRAMP_PROCESSOR_ENABLED")
         .unwrap_or_else(|_| "true".to_string())
@@ -548,8 +550,8 @@ async fn main() -> anyhow::Result<()> {
         != "false";
     let mut onramp_handle = None;
     if onramp_enabled {
-        if let (Some(pool), Some(client), Some(factory)) =
-            (db_pool.clone(), stellar_client.clone(), provider_factory.clone())
+        if let (Some(pool), Some(client), Some(factory), Some(redis)) =
+            (db_pool.clone(), stellar_client.clone(), provider_factory.clone(), redis_cache.clone())
         {
             let config = workers::onramp_processor::OnrampProcessorConfig::from_env();
             if config.system_wallet_address.is_empty() || config.system_wallet_secret.is_empty() {
@@ -561,10 +563,15 @@ async fn main() -> anyhow::Result<()> {
                     stellar_max_retries = config.stellar_max_retries,
                     "Starting onramp processor worker"
                 );
+
+                let mint_queue = services::mint_queue::MintQueueService::new(redis.pool.clone());
+                let mint_queue = Arc::new(mint_queue);
+
                 let processor = workers::onramp_processor::OnrampProcessor::new(
-                    pool,
-                    client,
-                    std::sync::Arc::new(factory),
+                    pool.clone(),
+                    client.clone(),
+                    (*mint_queue).clone(),
+                    factory.clone(),
                     config,
                 );
                 onramp_handle = Some(tokio::spawn(async move {
@@ -573,12 +580,31 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }));
                 info!("✅ Onramp processor worker started");
+
+                // Start Stellar Submitter Worker
+                let submitter_config = workers::stellar_submitter_worker::SubmitterConfig {
+                    system_wallet_address: std::env::var("SYSTEM_WALLET_ADDRESS").unwrap_or_default(),
+                    system_wallet_secret: std::env::var("SYSTEM_WALLET_SECRET").unwrap_or_default(),
+                    ..Default::default()
+                };
+                let submitter = workers::stellar_submitter_worker::StellarSubmitterWorker::new(
+                    pool,
+                    client,
+                    (*mint_queue).clone(),
+                    submitter_config,
+                );
+                tokio::spawn(async move {
+                    submitter.run(worker_shutdown_rx.clone()).await;
+                });
+                info!("✅ Stellar submitter worker started");
             }
         } else {
-            info!("Skipping onramp processor worker (missing db pool, stellar client, or provider factory)");
+            info!("Skipping onramp processor worker (missing db pool, stellar client, provider factory, or redis)");
         }
     } else {
         info!("Onramp processor worker disabled (ONRAMP_PROCESSOR_ENABLED=false)");
+    }
+
     // Start Bill Processor Worker
     let bill_processor_enabled = std::env::var("BILL_PROCESSOR_ENABLED")
         .unwrap_or_else(|_| "true".to_string())

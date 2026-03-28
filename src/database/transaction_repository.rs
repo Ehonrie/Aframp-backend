@@ -21,6 +21,8 @@ pub struct Transaction {
     pub blockchain_tx_hash: Option<String>,
     pub error_message: Option<String>,
     pub metadata: serde_json::Value,
+    pub priority_level: i32,
+    pub partner_tier: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -53,11 +55,12 @@ impl TransactionRepository {
         sqlx::query_as::<_, Transaction>(
             "INSERT INTO transactions 
              (wallet_address, type, from_currency, to_currency, from_amount, to_amount, 
-              cngn_amount, status, payment_provider, payment_reference, metadata) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) 
+              cngn_amount, status, payment_provider, payment_reference, metadata, priority_level, partner_tier) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) 
              RETURNING transaction_id, wallet_address, type, from_currency, to_currency, 
                        from_amount, to_amount, cngn_amount, status, payment_provider, 
                        payment_reference, blockchain_tx_hash, error_message, metadata, 
+                       priority_level, partner_tier,
                        created_at, updated_at",
         )
         .bind(wallet_address)
@@ -71,6 +74,8 @@ impl TransactionRepository {
         .bind(payment_provider)
         .bind(payment_reference)
         .bind(metadata)
+        .bind(0) // Default priority_level for new transactions
+        .bind("standard") // Default partner_tier
         .fetch_one(&self.pool)
         .await
         .map_err(DatabaseError::from_sqlx)
@@ -247,6 +252,7 @@ impl TransactionRepository {
             "SELECT transaction_id, wallet_address, type, from_currency, to_currency,
                     from_amount, to_amount, cngn_amount, status, payment_provider,
                     payment_reference, blockchain_tx_hash, error_message, metadata,
+                    priority_level, partner_tier,
                     created_at, updated_at
              FROM transactions
              WHERE status IN ('pending', 'processing', 'pending_payment')
@@ -338,6 +344,7 @@ impl Repository for TransactionRepository {
             "SELECT transaction_id, wallet_address, type, from_currency, to_currency, 
                     from_amount, to_amount, cngn_amount, status, payment_provider, 
                     payment_reference, blockchain_tx_hash, error_message, metadata, 
+                    priority_level, partner_tier,
                     created_at, updated_at 
              FROM transactions 
              ORDER BY created_at DESC",

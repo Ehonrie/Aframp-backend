@@ -26,6 +26,7 @@ pub mod ip_detection;
 #[cfg(feature = "database")]
 pub mod key_rotation;
 pub mod notification;
+pub mod mint_queue;
 #[cfg(feature = "database")]
 pub mod onramp_quote;
 #[cfg(feature = "database")]
