@@ -126,6 +126,9 @@ pub mod mtls;
 // Comprehensive audit logging system
 #[cfg(feature = "database")]
 pub mod audit;
+// Microservice-to-microservice authentication
+#[cfg(feature = "database")]
+pub mod service_auth;
 
 // Contract error enum for Soroban (only when not using database feature)
 #[cfg(not(feature = "database"))]
