@@ -126,6 +126,10 @@ pub mod gateway;
 // Reserve Vault — NGN collateral management, M-of-N multi-sig, custodian integration
 #[cfg(feature = "database")]
 pub mod vault;
+
+// Liquidity Monitor — Stellar DEX order-book depth & slippage surveillance
+#[cfg(feature = "database")]
+pub mod liquidity_monitor;
 // Consumer usage analytics & reporting system
 #[cfg(feature = "database")]
 pub mod analytics;
