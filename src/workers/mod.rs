@@ -11,5 +11,8 @@ pub mod payment_poller;
 pub mod reconciliation_worker;
 pub mod recurring_payment_worker;
 pub mod stellar_confirmation_worker;
+pub mod stellar_submitter_worker;
 pub mod transaction_monitor;
 pub mod webhook_retry;
+pub mod supply_monitor_worker;
+pub mod reconciliation_worker;
