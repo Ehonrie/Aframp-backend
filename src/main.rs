@@ -415,6 +415,12 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let mint_audit_store = std::sync::Arc::new(
+        crate::audit::MintAuditStore::from_env().unwrap_or_else(|e| {
+            panic!("Mint audit store initialization failed: {}", e);
+        }),
+    );
+
     // --- Cache warming (must complete before traffic is accepted) ---
     if let (Some(ref pool), Some(ref redis)) = (&db_pool, &redis_cache) {
         let registry = prometheus::default_registry();
@@ -446,6 +452,30 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
+
+    let mint_audit_verifier_enabled = std::env::var("MINT_AUDIT_VERIFICATION_ENABLED")
+        .unwrap_or_else(|_| "true".to_string())
+        .to_lowercase()
+        != "false";
+    let mint_audit_verifier_interval_secs = std::env::var("MINT_AUDIT_VERIFICATION_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+
+    if mint_audit_verifier_enabled {
+        let verifier_store = mint_audit_store.clone();
+        tokio::spawn(async move {
+            crate::audit::mint_log::run_verifier(
+                verifier_store,
+                mint_audit_verifier_interval_secs,
+                worker_shutdown_rx.clone(),
+            )
+            .await;
+        });
+        info!("✅ Mint audit verifier worker started (interval={}s)", mint_audit_verifier_interval_secs);
+    } else {
+        info!("Mint audit verifier disabled (MINT_AUDIT_VERIFICATION_ENABLED=false)");
+    }
     
     // Start Transaction Monitor Worker
     let monitor_enabled = std::env::var("TX_MONITOR_ENABLED")
@@ -569,6 +599,7 @@ async fn main() -> anyhow::Result<()> {
                     client,
                     std::sync::Arc::new(factory),
                     config,
+                    mint_audit_store.clone(),
                 );
                 onramp_handle = Some(tokio::spawn(async move {
                     if let Err(e) = processor.run(worker_shutdown_rx.clone()).await {

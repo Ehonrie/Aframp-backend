@@ -21,6 +21,7 @@ use crate::chains::stellar::trustline::CngnTrustlineManager;
 use crate::database::transaction_repository::{Transaction, TransactionRepository};
 use crate::payments::factory::PaymentProviderFactory;
 use crate::payments::types::{PaymentState, ProviderName, StatusRequest};
+use crate::audit::mint_log::MintAuditStore;
 use bigdecimal::BigDecimal;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,8 @@ pub struct OnrampProcessorConfig {
     pub system_wallet_address: String,
     /// System wallet secret seed (signing key for Stellar transactions)
     pub system_wallet_secret: String,
+    /// UUID of the admin/system actor used for mint audit records.
+    pub mint_audit_actor_id: String,
 }
 
 impl Default for OnrampProcessorConfig {
@@ -77,6 +80,7 @@ impl Default for OnrampProcessorConfig {
             refund_retry_backoff_secs: vec![30, 60, 120],
             system_wallet_address: String::new(),
             system_wallet_secret: String::new(),
+            mint_audit_actor_id: "00000000-0000-0000-0000-000000000000".to_string(),
         }
     }
 }
@@ -103,6 +107,8 @@ impl OnrampProcessorConfig {
                 .unwrap_or(cfg.stellar_confirmation_timeout_mins);
         cfg.system_wallet_address = std::env::var("SYSTEM_WALLET_ADDRESS").unwrap_or_default();
         cfg.system_wallet_secret = std::env::var("SYSTEM_WALLET_SECRET").unwrap_or_default();
+        cfg.mint_audit_actor_id = std::env::var("MINT_AUDIT_ACTOR_ID")
+            .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000000".to_string());
         cfg
     }
 }
@@ -214,6 +220,7 @@ pub struct OnrampProcessor {
     stellar: Arc<StellarClient>,
     provider_factory: Arc<PaymentProviderFactory>,
     config: OnrampProcessorConfig,
+    mint_audit: Arc<MintAuditStore>,
 }
 
 impl OnrampProcessor {
@@ -222,12 +229,14 @@ impl OnrampProcessor {
         stellar: StellarClient,
         provider_factory: Arc<PaymentProviderFactory>,
         config: OnrampProcessorConfig,
+        mint_audit: Arc<MintAuditStore>,
     ) -> Self {
         Self {
             db: Arc::new(db),
             stellar: Arc::new(stellar),
             provider_factory,
             config,
+            mint_audit,
         }
     }
 
@@ -718,6 +727,11 @@ impl OnrampProcessor {
             amount_cngn = %tx.cngn_amount,
             "Executing cNGN transfer on Stellar"
         );
+        self.record_mint_audit(
+            "MINT_REQUESTED",
+            self.mint_audit_payload(tx, None),
+        )
+        .await;
 
         // Guard: already has a blockchain hash — idempotent no-op
         if tx.blockchain_tx_hash.is_some() {
@@ -736,6 +750,14 @@ impl OnrampProcessor {
                 wallet = %tx.wallet_address,
                 "Destination has no cNGN trustline — initiating refund"
             );
+            self.record_mint_audit(
+                "MINT_FAILED",
+                self.mint_audit_payload(
+                    tx,
+                    Some(json!({ "reason": "trustline_not_found" })),
+                ),
+            )
+            .await;
             self.transition_failed(
                 &tx.transaction_id,
                 "processing",
@@ -757,6 +779,14 @@ impl OnrampProcessor {
                 required = %tx.cngn_amount,
                 "Insufficient cNGN liquidity — initiating refund"
             );
+            self.record_mint_audit(
+                "MINT_FAILED",
+                self.mint_audit_payload(
+                    tx,
+                    Some(json!({ "reason": "insufficient_liquidity" })),
+                ),
+            )
+            .await;
             self.transition_failed(
                 &tx.transaction_id,
                 "processing",
@@ -772,6 +802,12 @@ impl OnrampProcessor {
         }
 
         // Submit with retry + exponential backoff
+        self.record_mint_audit(
+            "MINT_APPROVED",
+            self.mint_audit_payload(tx, None),
+        )
+        .await;
+
         match self.submit_cngn_transfer_with_retry(tx).await {
             Ok(stellar_hash) => {
                 info!(
@@ -779,6 +815,14 @@ impl OnrampProcessor {
                     stellar_hash = %stellar_hash,
                     "cNGN transfer submitted to Stellar — awaiting confirmation"
                 );
+                self.record_mint_audit(
+                    "MINT_SUBMITTED",
+                    self.mint_audit_payload(
+                        tx,
+                        Some(json!({ "stellar_tx_hash": stellar_hash.clone() })),
+                    ),
+                )
+                .await;
 
                 // Persist the hash immediately so it's recoverable on crash
                 sqlx::query(
@@ -813,6 +857,14 @@ impl OnrampProcessor {
                     error = %e,
                     "All Stellar submission attempts exhausted — initiating refund"
                 );
+                self.record_mint_audit(
+                    "MINT_FAILED",
+                    self.mint_audit_payload(
+                        tx,
+                        Some(json!({ "reason": e.to_string() })),
+                    ),
+                )
+                .await;
                 let reason = if e.is_transient() {
                     FailureReason::StellarTransientError
                 } else {
@@ -988,6 +1040,45 @@ impl OnrampProcessor {
             })?;
 
         Ok(hash)
+    }
+
+    async fn record_mint_audit(&self, action_type: &str, request_payload: serde_json::Value) {
+        let actor_id = self.config.mint_audit_actor_id.clone();
+        let public_key = self.config.system_wallet_address.clone();
+        if let Err(e) = self
+            .mint_audit
+            .clone()
+            .append_event(actor_id, public_key, action_type.to_string(), request_payload)
+            .await
+        {
+            error!(error = %e, action_type = action_type, "Failed to write mint audit entry");
+        }
+    }
+
+    fn mint_audit_payload(&self, tx: &Transaction, extra: Option<serde_json::Value>) -> serde_json::Value {
+        let mut payload = json!({
+            "transaction_id": tx.transaction_id,
+            "wallet_address": tx.wallet_address,
+            "from_currency": tx.from_currency,
+            "to_currency": tx.to_currency,
+            "from_amount": tx.from_amount,
+            "to_amount": tx.to_amount,
+            "cngn_amount": tx.cngn_amount.to_string(),
+            "payment_provider": tx.payment_provider,
+            "payment_reference": tx.payment_reference,
+        });
+
+        if let Some(extra) = extra {
+            if let serde_json::Value::Object(extra_map) = extra {
+                if let serde_json::Value::Object(ref mut payload_map) = payload {
+                    for (key, value) in extra_map {
+                        payload_map.insert(key, value);
+                    }
+                }
+            }
+        }
+
+        payload
     }
 
     // =========================================================================
