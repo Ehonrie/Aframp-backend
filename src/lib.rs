@@ -126,6 +126,10 @@ pub mod gateway;
 // Reserve Vault — NGN collateral management, M-of-N multi-sig, custodian integration
 #[cfg(feature = "database")]
 pub mod vault;
+
+// Treasury Emergency Intervention Framework — one-click peg stabilisation
+#[cfg(feature = "database")]
+pub mod treasury;
 // Consumer usage analytics & reporting system
 #[cfg(feature = "database")]
 pub mod analytics;
