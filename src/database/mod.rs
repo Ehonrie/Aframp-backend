@@ -24,6 +24,7 @@ pub mod trustline_operation_repository;
 pub mod trustline_repository;
 pub mod wallet_repository;
 pub mod webhook_repository;
+pub mod reconciliation_repository;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
