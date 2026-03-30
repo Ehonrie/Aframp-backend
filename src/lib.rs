@@ -126,6 +126,18 @@ pub mod gateway;
 // Reserve Vault — NGN collateral management, M-of-N multi-sig, custodian integration
 #[cfg(feature = "database")]
 pub mod vault;
+
+// AML Financial Intelligence Layer — cross-border sanctions screening & pattern analysis
+#[cfg(feature = "database")]
+pub mod aml;
+
+// Nostro Account & Liquidity Management — shadow ledger, balance polling, EOD reconciliation
+#[cfg(feature = "database")]
+pub mod nostro;
+
+// Partner Reporting Engine — multi-tenant settlement statements & reconciliation API
+#[cfg(feature = "database")]
+pub mod reporting;
 // Consumer usage analytics & reporting system
 #[cfg(feature = "database")]
 pub mod analytics;
