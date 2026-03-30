@@ -207,6 +207,48 @@ impl StellarClient {
         Ok(extract_asset_balance(&account.balances, asset_code, issuer))
     }
 
+    /// Get transaction details by hash
+    pub async fn get_transaction_details(&self, tx_hash: &str) -> StellarResult<HorizonTransactionRecord> {
+        debug!("Fetching transaction details for hash: {}", tx_hash);
+
+        let url = format!("{}/transactions/{}", self.config.horizon_url(), tx_hash);
+
+        let response = timeout(
+            self.config.request_timeout,
+            self.http_client.get(&url).send(),
+        )
+        .await
+        .map_err(|_| StellarError::timeout_error(self.config.request_timeout.as_secs()))?;
+
+        let response = response.map_err(|e| {
+            if e.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+                StellarError::transaction_not_found(tx_hash)
+            } else if e.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) {
+                StellarError::RateLimitError
+            } else {
+                StellarError::network_error(format!("Horizon API error: {}", e))
+            }
+        })?;
+
+        let response = response.error_for_status().map_err(|e: reqwest::Error| {
+            if e.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+                StellarError::transaction_not_found(tx_hash)
+            } else if e.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) {
+                StellarError::RateLimitError
+            } else {
+                StellarError::network_error(format!("Horizon API error: {}", e))
+            }
+        })?;
+
+        let transaction: HorizonTransactionRecord = response
+            .json()
+            .await
+            .map_err(|e| StellarError::network_error(format!("JSON parsing error: {}", e)))?;
+
+        debug!("Successfully fetched transaction details for hash: {}", tx_hash);
+        Ok(transaction)
+    }
+
     pub async fn health_check(&self) -> StellarResult<HealthStatus> {
         let start_time = Instant::now();
         let horizon_url = self.config.horizon_url();
@@ -463,6 +505,84 @@ impl StellarClient {
                 StellarError::network_error(format!("Horizon operations fetch error: {}", e))
             }
         })?;
+
+        let body = response
+            .json::<JsonValue>()
+            .await
+            .map_err(|e| StellarError::serialization_error(format!("JSON parsing error: {}", e)))?;
+
+        Ok(body
+            .get("_embedded")
+            .and_then(|v| v.get("records"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Retrieves statistics for a specific asset, such as total supply, number of accounts, etc.
+    pub async fn get_asset_stats(&self, asset_code: &str, asset_issuer: &str) -> StellarResult<JsonValue> {
+        let url = format!(
+            "{}/assets?asset_code={}&asset_issuer={}",
+            self.config.horizon_url(),
+            asset_code,
+            asset_issuer
+        );
+
+        let response = timeout(
+            self.config.request_timeout,
+            self.http_client.get(&url).send(),
+        )
+        .await
+        .map_err(|_| StellarError::timeout_error(self.config.request_timeout.as_secs()))?
+        .map_err(|e| StellarError::network_error(format!("Horizon assets query error: {}", e)))?
+        .error_for_status()
+        .map_err(|e| StellarError::network_error(format!("Horizon assets query failed: {}", e)))?;
+
+        let body = response
+            .json::<JsonValue>()
+            .await
+            .map_err(|e| StellarError::serialization_error(format!("JSON parsing error: {}", e)))?;
+
+        let records = body
+            .get("_embedded")
+            .and_then(|v| v.get("records"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| StellarError::network_error("Missing records in asset stats response".to_string()))?;
+
+        if records.is_empty() {
+            return Err(StellarError::network_error(format!(
+                "Asset {}:{} not found",
+                asset_code, asset_issuer
+            )));
+        }
+
+        Ok(records[0].clone())
+    }
+
+    /// Lists accounts that hold a specific asset.
+    pub async fn list_asset_holders(
+        &self,
+        asset_code: &str,
+        asset_issuer: &str,
+        limit: usize,
+    ) -> StellarResult<Vec<JsonValue>> {
+        let url = format!(
+            "{}/accounts?asset={}:{}&limit={}&order=desc&sort=balance",
+            self.config.horizon_url(),
+            asset_code,
+            asset_issuer,
+            limit.min(200)
+        );
+
+        let response = timeout(
+            self.config.request_timeout,
+            self.http_client.get(&url).send(),
+        )
+        .await
+        .map_err(|_| StellarError::timeout_error(self.config.request_timeout.as_secs()))?
+        .map_err(|e| StellarError::network_error(format!("Horizon asset holders error: {}", e)))?
+        .error_for_status()
+        .map_err(|e| StellarError::network_error(format!("Horizon asset holders failed: {}", e)))?;
 
         let body = response
             .json::<JsonValue>()

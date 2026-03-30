@@ -6,3 +6,14 @@ pub mod offramp;
 pub mod offramp_models;
 pub mod wallet;
 pub mod webhooks;
+pub mod transaction_history;
+pub mod recurring;
+pub mod auth;
+pub mod openapi;
+pub mod admin;
+pub mod batch;
+pub mod key_rotation;
+pub mod developer;
+pub mod transparency;
+pub mod service_admin;
+
