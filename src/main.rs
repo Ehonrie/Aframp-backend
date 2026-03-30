@@ -1922,6 +1922,77 @@ async fn main() -> anyhow::Result<()> {
             }
         })
         .merge({
+            // ── Nigeria → Ghana Corridor routes (Issue #2.05) ─────────────────
+            if let Some(ref pool) = db_pool {
+                use corridors::ghana::{
+                    handlers::GhanaCorridorState,
+                    routes::{ghana_corridor_router, ghana_webhook_router},
+                    service::GhanaCorridorService,
+                    webhook::GhanaWebhookState,
+                };
+                use compliance_registry::ComplianceRegistryRepository;
+                use crate::payments::providers::ghana::{GhanaProvider, GhanaProviderConfig};
+
+                let corridor_id_str = std::env::var("GHANA_CORRIDOR_ID")
+                    .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000000".to_string());
+                let corridor_id = uuid::Uuid::parse_str(&corridor_id_str)
+                    .unwrap_or_else(|_| uuid::Uuid::nil());
+
+                let compliance_repo = std::sync::Arc::new(
+                    ComplianceRegistryRepository::new(pool.clone()),
+                );
+                let fee_svc = std::sync::Arc::new(
+                    crate::services::fee_calculation::FeeCalculationService::new(pool.clone()),
+                );
+
+                if let Ok(provider_config) = GhanaProviderConfig::from_env() {
+                    let rate_repo = crate::database::exchange_rate_repository::ExchangeRateRepository::new(pool.clone());
+                    let exchange_rate_svc = std::sync::Arc::new(
+                        crate::services::exchange_rate::ExchangeRateService::new(
+                            rate_repo,
+                            crate::services::exchange_rate::ExchangeRateServiceConfig::default(),
+                        )
+                        .add_provider(std::sync::Arc::new(
+                            crate::services::rate_providers::FixedRateProvider::new(),
+                        )),
+                    );
+
+                    let ghana_svc = std::sync::Arc::new(GhanaCorridorService::new(
+                        pool.clone(),
+                        compliance_repo,
+                        exchange_rate_svc,
+                        fee_svc,
+                        provider_config.clone(),
+                        corridor_id,
+                    ));
+
+                    let corridor_state = std::sync::Arc::new(GhanaCorridorState {
+                        service: ghana_svc,
+                        pool: std::sync::Arc::new(pool.clone()),
+                    });
+
+                    let provider = std::sync::Arc::new(
+                        GhanaProvider::new(provider_config)
+                            .expect("Ghana provider init failed"),
+                    );
+                    let webhook_state = std::sync::Arc::new(GhanaWebhookState {
+                        pool: std::sync::Arc::new(pool.clone()),
+                        provider,
+                    });
+
+                    info!("✅ Nigeria→Ghana corridor routes enabled");
+                    Router::new()
+                        .nest("/api/corridors/ghana", ghana_corridor_router(corridor_state))
+                        .merge(Router::new().nest("/webhooks", ghana_webhook_router(webhook_state)))
+                } else {
+                    info!("⏭️  Skipping Ghana corridor routes (HUBTEL_CLIENT_ID not set)");
+                    Router::new()
+                }
+            } else {
+                Router::new()
+            }
+        })
+        .merge({
             // ── Corridor Router routes (Issue #2.04) ─────────────────────────
             if let Some(ref pool) = db_pool {
                 use corridors::router::{
