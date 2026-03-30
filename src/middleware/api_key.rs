@@ -259,53 +259,6 @@ pub async fn resolve_api_key(
     .fetch_optional(pool)
     .await
     .ok()
-    .flatten();
-
-    let row = match row {
-        Some(r) => r,
-        None => return LookupResult::NotFound,
-    };
-
-    let now = Utc::now();
-
-    // 2. Check expiry.
-    if let Some(expires_at) = row.expires_at {
-        if expires_at <= now {
-            // Key is expired — check if it's within a grace period.
-            let grace_end = crate::services::key_rotation::check_grace_period(pool, row.key_id).await;
-            if let Some(grace_end) = grace_end {
-                // Still valid under grace period.
-                let auth = AuthenticatedKey {
-                    key_id: row.key_id,
-                    consumer_id: row.consumer_id,
-                    consumer_type: row.consumer_type,
-                    scopes: row.scopes.unwrap_or_default(),
-                    grace_period_warning: Some(format!(
-                        "This API key has been rotated. Please migrate to the new key before {}",
-                        grace_end.format("%Y-%m-%dT%H:%M:%SZ")
-                    )),
-                };
-                return LookupResult::GracePeriod { auth, grace_end };
-            }
-            return LookupResult::Expired {
-                key_id: row.key_id,
-                consumer_id: row.consumer_id,
-                expires_at,
-            };
-        }
-    }
-
-    // 3. Check is_active (deactivated by rotation completion or admin).
-    if !row.is_active {
-        // Could be an old key that was explicitly completed — treat as expired.
-        return LookupResult::Expired {
-            key_id: row.key_id,
-            consumer_id: row.consumer_id,
-            expires_at: row.expires_at.unwrap_or(now),
-        };
-    }
-
-    // 4. Valid key — update last_used_at asynchronously.
     .flatten()
     .unwrap_or_default();
 
@@ -321,27 +274,14 @@ pub async fn resolve_api_key(
         .await;
     });
 
-    LookupResult::Valid(AuthenticatedKey {
-        key_id: row.key_id,
-        consumer_id: row.consumer_id,
-        consumer_type: row.consumer_type,
-        scopes: row.scopes.unwrap_or_default(),
-        grace_period_warning: None,
     Some(AuthenticatedKey {
         key_id: matched.id,
         consumer_id: matched.consumer_id,
         consumer_type,
         environment: matched.environment,
         scopes,
+        grace_period_warning: None,
     })
-}
-
-/// Simplified lookup used by existing code paths (returns None for expired/invalid).
-pub async fn resolve_api_key(pool: &PgPool, raw_key: &str) -> Option<AuthenticatedKey> {
-    match resolve_api_key_full(pool, raw_key).await {
-        LookupResult::Valid(auth) | LookupResult::GracePeriod { auth, .. } => Some(auth),
-        _ => None,
-    }
 }
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
@@ -352,7 +292,6 @@ fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Axum middleware with full expiry and grace period enforcement (Issue #137).
-/// Axum middleware that enforces API key authentication and a required scope.
 ///
 /// State: `(Arc<PgPool>, &'static str /* required_scope */, &'static str /* environment */)`
 pub async fn scope_guard(
@@ -398,23 +337,6 @@ pub async fn scope_guard(
                 endpoint = %endpoint,
                 "Rejected expired API key"
             );
-            // Log to scope_audit_log for observability.
-            let pool_clone = pool.clone();
-            let ep = endpoint.clone();
-            tokio::spawn(async move {
-                let _ = sqlx::query!(
-                    r#"
-                    INSERT INTO scope_audit_log
-                        (api_key_id, consumer_id, action, scope_name, endpoint)
-                    VALUES ($1, $2, 'denied', 'expired_key', $3)
-                    "#,
-                    key_id,
-                    consumer_id,
-                    ep,
-                )
-                .execute(&pool_clone)
-                .await;
-            });
             return unauthorized(
                 "KEY_EXPIRED",
                 &format!(
@@ -426,24 +348,7 @@ pub async fn scope_guard(
 
         LookupResult::NotFound => {
             warn!(endpoint = %endpoint, "Invalid API key");
-            return unauthorized(
-                "INVALID_API_KEY",
-                "The provided API key is invalid",
-            );
-            debug!(endpoint = %endpoint, "No API key on request");
-            return unauthorized(
-                "MISSING_API_KEY",
-                "Authorization header with Bearer token or X-API-Key header is required",
-            );
-        }
-    };
-
-    let auth = match resolve_api_key(&pool, &raw_key, environment).await {
-        Some(a) => a,
-        None => {
-            // Generic 401 — never reveal whether the key exists
-            warn!(endpoint = %endpoint, "Invalid, expired, or wrong-environment API key");
-            return unauthorized("INVALID_API_KEY", "Invalid or expired API key");
+            return unauthorized("INVALID_API_KEY", "The provided API key is invalid");
         }
     };
 
@@ -456,30 +361,6 @@ pub async fn scope_guard(
             endpoint = %endpoint,
             "Scope denied"
         );
-
-        // Audit denial asynchronously
-        let pool_clone = pool.clone();
-        let key_id = auth.key_id;
-        let consumer_id = auth.consumer_id;
-        let scope = required_scope.to_string();
-        let ep = endpoint.clone();
-        let env = environment.to_string();
-        tokio::spawn(async move {
-            let _ = sqlx::query!(
-                r#"
-                INSERT INTO api_key_audit_log
-                    (event_type, api_key_id, consumer_id, environment, endpoint, rejection_reason)
-                VALUES ('rejected', $1, $2, $3, $4, $5)
-                "#,
-                key_id,
-                consumer_id,
-                env,
-                ep,
-                format!("missing scope: {}", scope),
-            )
-            .execute(&pool_clone)
-            .await;
-        });
         return forbidden(required_scope, &endpoint);
     }
 

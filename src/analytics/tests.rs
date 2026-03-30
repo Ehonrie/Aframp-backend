@@ -62,6 +62,7 @@ fn delta_zero_yesterday_no_panic() {
     // We test this indirectly via the public summary path; here we just verify the
     // model compiles and the zero-guard works.
     let _ = BigDecimal::from(0u32);
+}
 
 #[cfg(test)]
 mod tests {

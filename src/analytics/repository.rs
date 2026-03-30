@@ -1,14 +1,3 @@
-
-use crate::analytics::models::*;
-use crate::database::error::DatabaseError;
-use chrono::{DateTime, Utc};
-use sqlx::PgPool;
-
-/// All analytics queries run against a dedicated read-replica pool so they
-/// never contend with the primary transactional database.
-pub struct AnalyticsRepository {
-    /// Read-replica (or primary when a replica is not configured).
-
 use super::models::*;
 use crate::database::error::DatabaseError;
 use chrono::{DateTime, Utc};
@@ -16,7 +5,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 pub struct AnalyticsRepository {
-
     pool: PgPool,
 }
 
@@ -24,7 +12,6 @@ impl AnalyticsRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
-
 
     // ── Transaction Volume ────────────────────────────────────────────────
 
@@ -216,6 +203,12 @@ impl AnalyticsRepository {
     pub async fn active_providers(&self) -> Result<Vec<String>, DatabaseError> {
         let rows = sqlx::query!(
             "SELECT provider FROM payment_provider_configs WHERE is_enabled = true ORDER BY provider"
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(DatabaseError::from_sqlx)?;
+        Ok(rows.into_iter().map(|r| r.provider).collect())
+    }
 
     // ── Usage Snapshots ──────────────────────────────────────────────────────
 
@@ -596,18 +589,6 @@ impl AnalyticsRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(DatabaseError::from_sqlx)?;
-
-        Ok(rows.into_iter().map(|r| r.provider).collect())
-    }
-}
-
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-fn period_trunc(period: &str) -> &'static str {
-    match period {
-        "weekly" => "week",
-        "monthly" => "month",
-        _ => "day",
 
         Ok(rows)
     }

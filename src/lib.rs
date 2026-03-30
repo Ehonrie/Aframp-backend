@@ -119,6 +119,10 @@ pub mod pentest;
 #[cfg(feature = "database")]
 pub mod masking;
 
+// Liquidity pool architecture
+#[cfg(feature = "database")]
+pub mod liquidity;
+
 // API gateway security policy enforcement
 #[cfg(feature = "database")]
 pub mod gateway;
@@ -126,9 +130,6 @@ pub mod gateway;
 // Reserve Vault — NGN collateral management, M-of-N multi-sig, custodian integration
 #[cfg(feature = "database")]
 pub mod vault;
-// Consumer usage analytics & reporting system
-#[cfg(feature = "database")]
-pub mod analytics;
 // Adaptive rate limiting and throttling system
 #[cfg(feature = "cache")]
 pub mod adaptive_rate_limit;
@@ -139,17 +140,10 @@ pub mod mtls;
 // Comprehensive audit logging system
 #[cfg(feature = "database")]
 pub mod audit;
-// Microservice-to-microservice authentication
-#[cfg(feature = "database")]
-pub mod service_auth;
 
 // Abuse detection and automated response system
 #[cfg(feature = "database")]
 pub mod abuse_detection;
-
-// Audit logging system
-#[cfg(feature = "database")]
-pub mod audit;
 
 // Contract error enum for Soroban (only when not using database feature)
 #[cfg(not(feature = "database"))]

@@ -13,6 +13,7 @@ mod ddos;
 mod developer_portal;
 mod error;
 mod health;
+mod liquidity;
 mod logging;
 mod metrics;
 mod middleware;
@@ -1677,6 +1678,34 @@ async fn main() -> anyhow::Result<()> {
         Router::new()
     };
 
+    // ── Liquidity pool routes and health worker ───────────────────────────────
+    let liquidity_routes = if let (Some(pool), Some(cache)) = (db_pool.clone(), redis_cache.clone()) {
+        let liq_repo = std::sync::Arc::new(liquidity::repository::LiquidityRepository::new(pool));
+        let liq_service = std::sync::Arc::new(liquidity::service::LiquidityService::new(
+            liq_repo.clone(),
+            cache.pool.clone(),
+        ));
+        let liq_state = std::sync::Arc::new(liquidity::handlers::LiquidityHandlerState {
+            repo: liq_repo.clone(),
+            service: liq_service,
+        });
+
+        // Start health worker
+        let health_interval = std::env::var("LIQUIDITY_HEALTH_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60u64);
+        let liq_worker = liquidity::worker::LiquidityHealthWorker::new(liq_repo, health_interval);
+        tokio::spawn(liq_worker.run(worker_shutdown_rx.clone()));
+        info!("✅ Liquidity health worker started (interval={}s)", health_interval);
+
+        liquidity::routes::public_routes(liq_state.clone())
+            .merge(liquidity::routes::admin_routes(liq_state))
+    } else {
+        info!("⏭️  Skipping liquidity routes (missing database or cache)");
+        Router::new()
+    };
+
     // Setup OAuth 2.0 routes
     let oauth_routes = if let (Some(pool), Some(cache)) = (db_pool.clone(), redis_cache.clone()) {
         match oauth::RsaKeyPair::from_env() {
@@ -1705,54 +1734,6 @@ async fn main() -> anyhow::Result<()> {
         info!("⏭️  Skipping OAuth routes (missing database or cache)");
         Router::new()
     };
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/health", get(health))
-        .route("/health/ready", get(readiness))
-        .route("/health/live", get(liveness))
-        .route("/metrics", get(metrics::handler::metrics_handler))
-        .route("/api/stellar/account/{address}", get(get_stellar_account))
-        .route(
-            "/api/trustlines/operations",
-            post(create_trustline_operation),
-        )
-        .route(
-            "/api/trustlines/operations/{id}",
-            patch(update_trustline_operation_status),
-        )
-        .route(
-            "/api/trustlines/operations/wallet/{address}",
-            get(list_trustline_operations_by_wallet),
-        )
-        .route("/api/fees/calculate", post(calculate_fee))
-        .route("/api/cngn/trustlines/check", post(check_cngn_trustline))
-        .route(
-            "/api/cngn/trustlines/preflight",
-            post(preflight_cngn_trustline),
-        )
-        .route("/api/cngn/trustlines/build", post(build_cngn_trustline))
-        .route("/api/cngn/trustlines/submit", post(submit_cngn_trustline))
-        .route(
-            "/api/cngn/trustlines/retry/{id}",
-            post(retry_cngn_trustline),
-        )
-        .route("/api/cngn/payments/build", post(build_cngn_payment))
-        .route("/api/cngn/payments/sign", post(sign_cngn_payment))
-        .route("/api/cngn/payments/submit", post(submit_cngn_payment))
-        .route("/api/payments/initiate", post(initiate_payment))
-        .merge(onramp_routes)
-        .merge(offramp_routes)
-        .merge(wallet_routes)
-        .merge(rates_routes)
-        .merge(fees_routes)
-        .merge(webhook_routes)
-        .merge(history_routes)
-        .merge(auth_routes)
-        .merge(batch_routes)
-        .merge(admin_routes)
-        .merge(adaptive_rl_admin_routes)
-        .merge(openapi_routes)
-        .merge(recurring_routes)
     // ── Transparency Portal (Issue #239) ─────────────────────────────────────
     let transparency_routes = if let Some(pool) = db_pool.clone() {
         let signing_key = api::transparency::load_signing_key();
@@ -1822,6 +1803,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(history_routes)
         .merge(ddos_admin_routes)
         .merge(pentest_routes)
+        .merge(liquidity_routes)
         .merge(developer_portal::routes::register_developer_portal_routes(Router::new(), db_pool.clone()))
         .merge(Router::new().nest("/api/admin/security", mtls_admin_routes))
         .merge(transparency_routes)

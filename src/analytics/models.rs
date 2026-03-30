@@ -127,6 +127,7 @@ pub struct SummaryResponse {
     pub total_cngn_transferred: DeltaMetric,
     pub active_wallets: DeltaMetric,
     pub health: HealthIndicators,
+}
 
 use uuid::Uuid;
 

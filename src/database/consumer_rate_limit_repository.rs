@@ -4,11 +4,11 @@ use super::{DatabaseError, PgPool, TransactionalRepository};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{json::PgJson, FromRow, PgPool};
+use sqlx::FromRow;
 use std::sync::Arc;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow, sqlx::Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "consumer_type", rename_all = "snake_case")]
 pub enum ConsumerType {
     MobileClient,
@@ -31,9 +31,9 @@ pub struct LimitDimension {
 pub struct RateLimitsConfig {
     #[serde(flatten)]
     pub global: LimitDimension,
-    #[serde(flatten, prefix = "endpoint_")]
-    pub endpoint: std::collections::HashMap<String, LimitDimension>,  // endpoint_standard, etc.
-    #[serde(flatten, prefix = "tx_")]
+    #[serde(flatten)]
+    pub endpoint: std::collections::HashMap<String, LimitDimension>,
+    #[serde(flatten)]
     pub transaction_type: std::collections::HashMap<String, LimitDimension>,
     #[serde(flatten)]
     pub ip: LimitDimension,
