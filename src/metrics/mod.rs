@@ -5,6 +5,7 @@
 //! applicable, and the `aframp_` namespace prefix.
 pub mod geo_restriction;
 pub mod handler;
+pub mod issuer;
 pub mod tests;
 
 use prometheus::{
@@ -846,8 +847,11 @@ fn register_all(r: &Registry) {
     security::register(r);
     service_auth::register(r);
     ip_detection::register(r);
+    alerting::register(r);
+    issuer::register(r);
     crate::ddos::metrics::register(r);
     crate::crypto::metrics::register(r);
+    crate::admin::mint_signer_metrics::register(r);
     crate::key_management::metrics::register(r);
     crate::pentest::metrics::register(r);
     crate::masking::metrics::register(r);

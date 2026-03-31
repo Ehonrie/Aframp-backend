@@ -3,9 +3,13 @@ mod api;
 mod api_keys;
 mod analytics;
 mod audit;
+mod auditor_portal;
 mod auth;
+mod verification;
 mod cache;
 mod chains;
+mod compliance_registry;
+mod corridors;
 mod config;
 mod config_validation;
 mod database;
@@ -14,11 +18,14 @@ mod developer_portal;
 mod error;
 mod health;
 mod logging;
+mod lp_payout;
 mod metrics;
+mod peg_monitor;
 mod middleware;
 mod mtls;
 mod oauth;
 mod payments;
+mod bug_bounty;
 mod pentest;
 mod recurring;
 mod security_compliance;
@@ -415,6 +422,21 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // ── Collateral Verification Engine (Issue #217) ───────────────────────────
+    let verification_engine = if let (Some(ref pool), Some(ref stellar)) = (&db_pool, &stellar_client) {
+        let engine = std::sync::Arc::new(verification::engine::VerificationEngine::new(
+            std::sync::Arc::new(stellar.clone()),
+            pool.clone(),
+        ));
+        let worker = verification::worker::VerificationWorker::new(engine.clone());
+        tokio::spawn(worker.run(worker_shutdown_rx.clone()));
+        info!("✅ Collateral verification engine started");
+        Some(engine)
+    } else {
+        info!("⏭️  Skipping verification engine (no database/stellar)");
+        None
+    };
+
     // --- Cache warming (must complete before traffic is accepted) ---
     if let (Some(ref pool), Some(ref redis)) = (&db_pool, &redis_cache) {
         let registry = prometheus::default_registry();
@@ -799,6 +821,32 @@ async fn main() -> anyhow::Result<()> {
             info!("✅ Webhook retry worker started");
         }
 
+    // Start Reconciliation Worker
+    let reconciliation_enabled = std::env::var("RECONCILIATION_WORKER_ENABLED")
+        .unwrap_or_else(|_| "true".to_string())
+        .to_lowercase()
+        != "false";
+    if reconciliation_enabled {
+        if let (Some(pool), Some(client)) = (db_pool.clone(), stellar_client.clone()) {
+            let config = workers::reconciliation_worker::ReconciliationConfig::from_env();
+            info!(
+                interval_mins = config.interval.as_secs() / 60,
+                "Starting reconciliation worker"
+            );
+            let worker = workers::reconciliation_worker::ReconciliationWorker::new(
+                pool,
+                client,
+                config,
+            );
+            tokio::spawn(worker.run(worker_shutdown_rx.clone()));
+            info!("✅ Reconciliation worker started");
+        } else {
+            info!("Skipping reconciliation worker (missing db pool or stellar client)");
+        }
+    } else {
+        info!("Reconciliation worker disabled (RECONCILIATION_WORKER_ENABLED=false)");
+    }
+
         let webhook_state = api::webhooks::WebhookState {
             processor: webhook_processor,
         };
@@ -813,6 +861,35 @@ async fn main() -> anyhow::Result<()> {
 
     // Create the application router with logging middleware
     info!("🛣️  Setting up application routes...");
+
+    // ── LP Payout Engine (Liquidity Provider rewards) ─────────────────────────
+    let lp_payout_routes = if let (Some(pool), Some(client)) =
+        (db_pool.clone(), stellar_client.clone())
+    {
+        let lp_repo = std::sync::Arc::new(lp_payout::LpPayoutRepository::new(pool.clone()));
+        let lp_config = lp_payout::LpPayoutWorkerConfig::from_env();
+
+        let lp_worker_enabled = std::env::var("LP_PAYOUT_WORKER_ENABLED")
+            .unwrap_or_else(|_| "true".to_string())
+            .to_lowercase()
+            != "false";
+
+        if lp_worker_enabled {
+            if lp_config.pool_id.is_empty() {
+                warn!("LP_STELLAR_POOL_ID not set — LP payout worker will skip snapshots");
+            }
+            let worker = lp_payout::LpPayoutWorker::new(lp_repo.clone(), client, lp_config);
+            tokio::spawn(worker.run(worker_shutdown_rx.clone()));
+            info!("✅ LP Payout worker started");
+        } else {
+            info!("LP Payout worker disabled (LP_PAYOUT_WORKER_ENABLED=false)");
+        }
+
+        lp_payout::lp_payout_routes(lp_repo)
+    } else {
+        info!("⏭️  Skipping LP payout routes (missing database or stellar client)");
+        Router::new()
+    };
 
     // Setup onramp routes (quote service)
     let onramp_routes = if let (Some(pool), Some(cache), Some(client)) =
@@ -1569,6 +1646,25 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Router::new()
     };
+
+    // ── External Auditor Portal ───────────────────────────────────────────────
+    let auditor_portal_routes = if let Some(ref pool) = db_pool {
+        let audit_repo = std::sync::Arc::new(audit::repository::AuditLogRepository::new(pool.clone()));
+        let auditor_repo = std::sync::Arc::new(auditor_portal::repository::AuditorRepository::new(pool.clone()));
+        let auditor_service = std::sync::Arc::new(auditor_portal::service::AuditorService::new(
+            auditor_repo,
+            audit_repo,
+        ));
+        let state = std::sync::Arc::new(auditor_portal::handlers::AuditorPortalState {
+            service: auditor_service,
+        });
+        info!("🔍 External auditor portal routes enabled");
+        auditor_portal::routes::auditor_routes(state.clone())
+            .merge(auditor_portal::routes::admin_auditor_routes(state))
+    } else {
+        info!("⏭️  Skipping auditor portal routes (no database)");
+        Router::new()
+    };
     let (ddos_state, ddos_admin_routes) = if let Some(ref cache) = redis_cache {
         let ddos_config = ddos::config::DdosConfig::from_env();
         let state = std::sync::Arc::new(ddos::state::DdosState::new(ddos_config, cache.clone()));
@@ -1677,6 +1773,36 @@ async fn main() -> anyhow::Result<()> {
         Router::new()
     };
 
+    // ── Bug Bounty Programme ──────────────────────────────────────────────────
+    let bug_bounty_routes = if let Some(pool) = db_pool.clone() {
+        let repo = std::sync::Arc::new(bug_bounty::BugBountyRepository::new(pool));
+        let config = bug_bounty::BugBountyConfig::default();
+        let registry = prometheus::default_registry();
+        let metrics = std::sync::Arc::new(
+            bug_bounty::metrics::BugBountyMetrics::new(registry).unwrap_or_else(|e| {
+                tracing::warn!("Bug bounty metrics registration failed ({}); using fallback", e);
+                bug_bounty::metrics::BugBountyMetrics::new(&prometheus::Registry::new())
+                    .expect("fallback registry must succeed")
+            }),
+        );
+        let notification_dispatcher = std::sync::Arc::new(
+            bug_bounty::notifications::NotificationDispatcher::new(repo.clone()),
+        );
+        let svc = std::sync::Arc::new(bug_bounty::BugBountyService::new(
+            repo,
+            notification_dispatcher,
+            config.clone(),
+            metrics,
+        ));
+        // Spawn SLA polling worker
+        bug_bounty::SlaPollingWorker::spawn(svc.clone(), &config);
+        info!("🐛 Bug bounty programme routes enabled");
+        bug_bounty::bug_bounty_routes(svc)
+    } else {
+        info!("⏭️  Skipping bug bounty routes (no database)");
+        Router::new()
+    };
+
     // Setup OAuth 2.0 routes
     let oauth_routes = if let (Some(pool), Some(cache)) = (db_pool.clone(), redis_cache.clone()) {
         match oauth::RsaKeyPair::from_env() {
@@ -1745,6 +1871,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(wallet_routes)
         .merge(rates_routes)
         .merge(fees_routes)
+        .merge(mint_routes)
         .merge(webhook_routes)
         .merge(history_routes)
         .merge(auth_routes)
@@ -1764,6 +1891,40 @@ async fn main() -> anyhow::Result<()> {
         api::transparency::transparency_routes(state)
     } else {
         info!("⏭️  Skipping transparency routes (no database)");
+        Router::new()
+    };
+
+    // ── Peg Integrity Monitor ─────────────────────────────────────────────────
+    let peg_monitor_routes = if let (Some(pool), Some(client)) =
+        (db_pool.clone(), stellar_client.clone())
+    {
+        let peg_repo = std::sync::Arc::new(peg_monitor::PegMonitorRepository::new(pool));
+        let asset_code = std::env::var("CNGN_ASSET_CODE").unwrap_or_else(|_| "cNGN".to_string());
+        let asset_issuer = std::env::var("CNGN_ISSUER_ADDRESS")
+            .or_else(|_| std::env::var("CNGN_ISSUER_MAINNET"))
+            .unwrap_or_default();
+
+        let peg_enabled = std::env::var("PEG_MONITOR_ENABLED")
+            .unwrap_or_else(|_| "true".to_string())
+            .to_lowercase()
+            != "false";
+
+        if peg_enabled && !asset_issuer.is_empty() {
+            let worker = peg_monitor::PegMonitorWorker::new(
+                peg_repo.clone(),
+                client,
+                asset_code,
+                asset_issuer,
+            );
+            tokio::spawn(worker.run(worker_shutdown_rx.clone()));
+            info!("✅ Peg Integrity Monitor worker started");
+        } else {
+            info!("⏭️  Peg monitor worker skipped (disabled or missing CNGN_ISSUER_ADDRESS)");
+        }
+
+        peg_monitor::peg_monitor_routes(peg_repo)
+    } else {
+        info!("⏭️  Skipping peg monitor routes (missing database or stellar client)");
         Router::new()
     };
     let app = Router::new()
@@ -1813,6 +1974,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(admin_routes)
         .merge(adaptive_rl_admin_routes)
         .merge(audit_routes)
+        .merge(auditor_portal_routes)
         .merge(key_rotation_routes)
         .merge(analytics_routes)
         .merge(openapi_routes)
@@ -1822,10 +1984,12 @@ async fn main() -> anyhow::Result<()> {
         .merge(history_routes)
         .merge(ddos_admin_routes)
         .merge(pentest_routes)
+        .merge(bug_bounty_routes)
         .merge(developer_portal::routes::register_developer_portal_routes(Router::new(), db_pool.clone()))
         .merge(Router::new().nest("/api/admin/security", mtls_admin_routes))
         .merge(transparency_routes)
         .merge(security_compliance_routes)
+        .merge(lp_payout_routes)
         .with_state(AppState {
             db_pool,
             redis_cache,
@@ -2094,6 +2258,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = offramp_handle {
         if let Err(e) = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
             error!(error = %e, "Timed out waiting for offramp worker shutdown");
+        }
+    }
+    if let Some(handle) = mint_expiry_handle {
+        if let Err(e) = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+            error!(error = %e, "Timed out waiting for mint expiry worker shutdown");
         }
     }
 
