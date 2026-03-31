@@ -5,10 +5,10 @@ mod analytics;
 mod audit;
 mod auditor_portal;
 mod auth;
+mod verification;
 mod cache;
 mod chains;
 mod compliance_registry;
-mod corridors;
 mod config;
 mod config_validation;
 mod database;
@@ -417,6 +417,21 @@ async fn main() -> anyhow::Result<()> {
         Some(writer)
     } else {
         info!("⏭️  Skipping audit writer (no database/redis)");
+        None
+    };
+
+    // ── Collateral Verification Engine (Issue #217) ───────────────────────────
+    let verification_engine = if let (Some(ref pool), Some(ref stellar)) = (&db_pool, &stellar_client) {
+        let engine = std::sync::Arc::new(verification::engine::VerificationEngine::new(
+            std::sync::Arc::new(stellar.clone()),
+            pool.clone(),
+        ));
+        let worker = verification::worker::VerificationWorker::new(engine.clone());
+        tokio::spawn(worker.run(worker_shutdown_rx.clone()));
+        info!("✅ Collateral verification engine started");
+        Some(engine)
+    } else {
+        info!("⏭️  Skipping verification engine (no database/stellar)");
         None
     };
 
