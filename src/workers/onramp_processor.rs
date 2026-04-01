@@ -22,6 +22,7 @@ use crate::database::transaction_repository::{Transaction, TransactionRepository
 use crate::services::mint_queue::{MintQueueService, MintRequest};
 use crate::payments::factory::PaymentProviderFactory;
 use crate::payments::types::{PaymentState, ProviderName, StatusRequest};
+use crate::audit::mint_log::MintAuditStore;
 use bigdecimal::BigDecimal;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,8 @@ pub struct OnrampProcessorConfig {
     pub system_wallet_address: String,
     /// System wallet secret seed (signing key for Stellar transactions)
     pub system_wallet_secret: String,
+    /// UUID of the admin/system actor used for mint audit records.
+    pub mint_audit_actor_id: String,
 }
 
 impl Default for OnrampProcessorConfig {
@@ -78,6 +81,7 @@ impl Default for OnrampProcessorConfig {
             refund_retry_backoff_secs: vec![30, 60, 120],
             system_wallet_address: String::new(),
             system_wallet_secret: String::new(),
+            mint_audit_actor_id: "00000000-0000-0000-0000-000000000000".to_string(),
         }
     }
 }
@@ -104,6 +108,8 @@ impl OnrampProcessorConfig {
                 .unwrap_or(cfg.stellar_confirmation_timeout_mins);
         cfg.system_wallet_address = std::env::var("SYSTEM_WALLET_ADDRESS").unwrap_or_default();
         cfg.system_wallet_secret = std::env::var("SYSTEM_WALLET_SECRET").unwrap_or_default();
+        cfg.mint_audit_actor_id = std::env::var("MINT_AUDIT_ACTOR_ID")
+            .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000000".to_string());
         cfg
     }
 }
@@ -216,6 +222,7 @@ pub struct OnrampProcessor {
     queue: Arc<MintQueueService>,
     provider_factory: Arc<PaymentProviderFactory>,
     config: OnrampProcessorConfig,
+    mint_audit: Arc<MintAuditStore>,
 }
 
 impl OnrampProcessor {
@@ -225,6 +232,7 @@ impl OnrampProcessor {
         queue: MintQueueService,
         provider_factory: Arc<PaymentProviderFactory>,
         config: OnrampProcessorConfig,
+        mint_audit: Arc<MintAuditStore>,
     ) -> Self {
         Self {
             db: Arc::new(db),
@@ -232,6 +240,7 @@ impl OnrampProcessor {
             queue: Arc::new(queue),
             provider_factory,
             config,
+            mint_audit,
         }
     }
 
@@ -722,6 +731,11 @@ impl OnrampProcessor {
             amount_cngn = %tx.cngn_amount,
             "Enqueuing cNGN transfer for Stellar submission"
         );
+        self.record_mint_audit(
+            "MINT_REQUESTED",
+            self.mint_audit_payload(tx, None),
+        )
+        .await;
 
         let mint_req = MintRequest {
             transaction_id: tx.transaction_id,
@@ -876,6 +890,45 @@ impl OnrampProcessor {
             })?;
 
         Ok(hash)
+    }
+
+    async fn record_mint_audit(&self, action_type: &str, request_payload: serde_json::Value) {
+        let actor_id = self.config.mint_audit_actor_id.clone();
+        let public_key = self.config.system_wallet_address.clone();
+        if let Err(e) = self
+            .mint_audit
+            .clone()
+            .append_event(actor_id, public_key, action_type.to_string(), request_payload)
+            .await
+        {
+            error!(error = %e, action_type = action_type, "Failed to write mint audit entry");
+        }
+    }
+
+    fn mint_audit_payload(&self, tx: &Transaction, extra: Option<serde_json::Value>) -> serde_json::Value {
+        let mut payload = json!({
+            "transaction_id": tx.transaction_id,
+            "wallet_address": tx.wallet_address,
+            "from_currency": tx.from_currency,
+            "to_currency": tx.to_currency,
+            "from_amount": tx.from_amount,
+            "to_amount": tx.to_amount,
+            "cngn_amount": tx.cngn_amount.to_string(),
+            "payment_provider": tx.payment_provider,
+            "payment_reference": tx.payment_reference,
+        });
+
+        if let Some(extra) = extra {
+            if let serde_json::Value::Object(extra_map) = extra {
+                if let serde_json::Value::Object(ref mut payload_map) = payload {
+                    for (key, value) in extra_map {
+                        payload_map.insert(key, value);
+                    }
+                }
+            }
+        }
+
+        payload
     }
 
     // =========================================================================

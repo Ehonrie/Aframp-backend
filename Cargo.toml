@@ -248,6 +248,7 @@ hex = "0.4"
 tokio       = { version = "1.49.0", features = ["full"] }
 tokio-test  = "0.4"
 bigdecimal  = "0.4"
+proptest    = "1.4"
 
 [[test]]
 name = "payload_encryption_test"
@@ -268,3 +269,6 @@ required-features = ["database"]
 name = "liquidity_integration"
 path = "tests/liquidity_integration.rs"
 required-features = ["integration"]
+name = "bug_bounty_integration"
+path = "tests/bug_bounty_integration.rs"
+required-features = ["database"]

@@ -1,27 +1,18 @@
-//! API key authentication, scope enforcement, and expiry management (Issues #132, #137).
+//! API key authentication, scope enforcement, and expiry management (Issues #131, #132, #137).
 //!
 //! Changes in Issue #137:
 //!   - Expired keys return 401 with code `KEY_EXPIRED` (distinct from `INVALID_API_KEY`)
 //!   - Keys within an active grace period pass with `X-Key-Deprecation-Warning` header
 //!   - Every expired-key rejection is logged with consumer_id, key_id, expiry, and request time
-//! API key authentication and scope enforcement middleware (Issue #131 / #132).
 //!
 //! Verification flow:
 //!   1. Extract `Authorization: Bearer <key>` or `X-API-Key: <key>` header.
-//!   2. Derive the 8-char prefix from the raw key for fast index lookup.
-//!   3. Fetch all active keys sharing that prefix + environment from DB.
-//!   4. Verify the raw key against each candidate's Argon2id hash.
-//!   5. Reject keys scoped to the wrong environment.
-//!   6. Check required scope is granted.
-//!   7. Update last_used_at asynchronously (non-blocking).
-//!   8. Inject `AuthenticatedKey` into request extensions.
-//!
-//! Security guarantees:
-//!   - 401 is returned for any verification failure — never reveals whether
-//!     the key ID exists.
-//!   - Plaintext key is never logged at any level.
-//!   - last_used_at update is fire-and-forget (does not block the request).
-
+//!   2. Hash the raw key with SHA-256 for DB lookup.
+//!   3. Fetch the key record from DB (includes expiry, scopes, consumer).
+//!   4. Check expiry — if expired, check grace period.
+//!   5. Check required scope is granted.
+//!   6. Update last_used_at asynchronously (non-blocking).
+//!   7. Inject `AuthenticatedKey` into request extensions.
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -32,6 +23,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -81,12 +73,6 @@ fn forbidden(scope: &str, endpoint: &str) -> Response {
         .into_response()
 }
 
-// ─── Key Lookup ───────────────────────────────────────────────────────────────
-
-fn hash_key(raw_key: &str) -> String {
-    let digest = Sha256::digest(raw_key.as_bytes());
-    hex::encode(digest)
-}
 // ─── Resolved Key Context ─────────────────────────────────────────────────────
 
 /// Injected into request extensions after successful authentication.
@@ -118,11 +104,19 @@ enum LookupResult {
     NotFound,
 }
 
+// ─── Key Hashing ─────────────────────────────────────────────────────────────
+
+fn hash_key(raw_key: &str) -> String {
+    let digest = Sha256::digest(raw_key.as_bytes());
+    hex::encode(digest)
+}
+
+// ─── Key Resolution ───────────────────────────────────────────────────────────
+
 /// Full key resolution with expiry and grace period awareness.
 async fn resolve_api_key_full(pool: &PgPool, raw_key: &str) -> LookupResult {
     let hash = hash_key(raw_key);
 
-    // 1. Look up the key regardless of expiry so we can distinguish expired vs invalid.
     let row = sqlx::query!(
         r#"
         SELECT
@@ -263,8 +257,55 @@ pub async fn resolve_api_key(
     .unwrap_or_default();
 
     // Update last_used_at asynchronously — does not block the request
+    let row = match row {
+        Ok(Some(r)) => r,
+        Ok(None) => return LookupResult::NotFound,
+        Err(e) => {
+            warn!(error = %e, "DB error during API key lookup");
+            return LookupResult::NotFound;
+        }
+    };
+
+    let now = Utc::now();
+
+    // Check expiry.
+    if let Some(expires_at) = row.expires_at {
+        if expires_at <= now {
+            let grace_end = crate::services::key_rotation::check_grace_period(pool, row.key_id).await;
+            if let Some(grace_end) = grace_end {
+                let auth = AuthenticatedKey {
+                    key_id: row.key_id,
+                    consumer_id: row.consumer_id,
+                    consumer_type: row.consumer_type,
+                    environment: String::new(),
+                    scopes: row.scopes.unwrap_or_default(),
+                    grace_period_warning: Some(format!(
+                        "This API key has been rotated. Please migrate to the new key before {}",
+                        grace_end.format("%Y-%m-%dT%H:%M:%SZ")
+                    )),
+                };
+                return LookupResult::GracePeriod { auth, grace_end };
+            }
+            return LookupResult::Expired {
+                key_id: row.key_id,
+                consumer_id: row.consumer_id,
+                expires_at,
+            };
+        }
+    }
+
+    // Check is_active.
+    if !row.is_active {
+        return LookupResult::Expired {
+            key_id: row.key_id,
+            consumer_id: row.consumer_id,
+            expires_at: row.expires_at.unwrap_or(now),
+        };
+    }
+
+    // Valid key — update last_used_at asynchronously.
     let pool_clone = pool.clone();
-    let key_id = matched.id;
+    let key_id = row.key_id;
     tokio::spawn(async move {
         let _ = sqlx::query!(
             "UPDATE api_keys SET last_used_at = now() WHERE id = $1",
@@ -280,16 +321,42 @@ pub async fn resolve_api_key(
         consumer_type,
         environment: matched.environment,
         scopes,
+    LookupResult::Valid(AuthenticatedKey {
+        key_id: row.key_id,
+        consumer_id: row.consumer_id,
+        consumer_type: row.consumer_type,
+        environment: String::new(),
+        scopes: row.scopes.unwrap_or_default(),
         grace_period_warning: None,
     })
 }
 
-// ─── Middleware ───────────────────────────────────────────────────────────────
+// ─── Key Extraction ───────────────────────────────────────────────────────────
 
-fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get("authorization")?.to_str().ok()?;
-    value.strip_prefix("Bearer ")
+/// Extract the raw API key from `Authorization: Bearer <key>` or `X-API-Key: <key>`.
+fn extract_raw_key(headers: &HeaderMap) -> Option<String> {
+    if let Some(bearer) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        return Some(bearer.to_string());
+    }
+    headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
+
+/// Simplified lookup used by existing code paths (returns None for expired/invalid).
+pub async fn resolve_api_key(pool: &PgPool, raw_key: &str) -> Option<AuthenticatedKey> {
+    match resolve_api_key_full(pool, raw_key).await {
+        LookupResult::Valid(auth) | LookupResult::GracePeriod { auth, .. } => Some(auth),
+        _ => None,
+    }
+}
+
+// ─── Middleware ───────────────────────────────────────────────────────────────
 
 /// Axum middleware with full expiry and grace period enforcement (Issue #137).
 ///
@@ -307,7 +374,7 @@ pub async fn scope_guard(
             debug!("No bearer token on request to {}", endpoint);
             return unauthorized(
                 "MISSING_API_KEY",
-                "Authorization header with Bearer token is required",
+                "Authorization header with Bearer token or X-API-Key header is required",
             );
         }
     };
@@ -337,6 +404,22 @@ pub async fn scope_guard(
                 endpoint = %endpoint,
                 "Rejected expired API key"
             );
+            let pool_clone = pool.clone();
+            let ep = endpoint.clone();
+            tokio::spawn(async move {
+                let _ = sqlx::query!(
+                    r#"
+                    INSERT INTO scope_audit_log
+                        (api_key_id, consumer_id, action, scope_name, endpoint)
+                    VALUES ($1, $2, 'denied', 'expired_key', $3)
+                    "#,
+                    key_id,
+                    consumer_id,
+                    ep,
+                )
+                .execute(&pool_clone)
+                .await;
+            });
             return unauthorized(
                 "KEY_EXPIRED",
                 &format!(
@@ -361,6 +444,29 @@ pub async fn scope_guard(
             endpoint = %endpoint,
             "Scope denied"
         );
+
+        let pool_clone = pool.clone();
+        let key_id = auth.key_id;
+        let consumer_id = auth.consumer_id;
+        let scope = required_scope.to_string();
+        let ep = endpoint.clone();
+        let env = environment.to_string();
+        tokio::spawn(async move {
+            let _ = sqlx::query!(
+                r#"
+                INSERT INTO api_key_audit_log
+                    (event_type, api_key_id, consumer_id, environment, endpoint, rejection_reason)
+                VALUES ('rejected', $1, $2, $3, $4, $5)
+                "#,
+                key_id,
+                consumer_id,
+                env,
+                ep,
+                format!("missing scope: {}", scope),
+            )
+            .execute(&pool_clone)
+            .await;
+        });
         return forbidden(required_scope, &endpoint);
     }
 
@@ -373,7 +479,6 @@ pub async fn scope_guard(
         "API key authorized"
     );
 
-    // Attach deprecation warning header for grace-period keys.
     let grace_warning = auth.grace_period_warning.clone();
     req.extensions_mut().insert(auth);
     let mut response = next.run(req).await;

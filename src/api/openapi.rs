@@ -383,6 +383,42 @@ pub struct UpdateScopesRequest {
     pub scopes: Vec<String>,
 }
 
+/// Signed Proof-of-Reserves response returned by `GET /v1/public/transparency`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct TransparencyResponseSchema {
+    /// Total cNGN in circulation.
+    pub total_supply: String,
+    /// Total NGN reserves held.
+    pub total_reserves: String,
+    /// Ratio of reserves to supply (1.0 = fully backed).
+    pub collateral_ratio: String,
+    /// ISO-8601 timestamp of the most recent snapshot.
+    pub last_updated_timestamp: String,
+    /// URL to the third-party audit report, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit_link: Option<String>,
+    /// Hex-encoded Ed25519 signature over the canonical payload.
+    pub signature: String,
+    /// Hex-encoded Ed25519 public key used to produce `signature`.
+    pub signing_key: String,
+}
+
+/// A single historical data point for `GET /v1/public/transparency/history`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ReserveDataPointSchema {
+    pub total_supply: String,
+    pub total_reserves: String,
+    pub collateral_ratio: String,
+    pub timestamp: String,
+}
+
+/// Response for `GET /v1/public/transparency/history`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct TransparencyHistorySchema {
+    pub period_days: u32,
+    pub data_points: Vec<ReserveDataPointSchema>,
+}
+
 // ─── OpenAPI Document ────────────────────────────────────────────────────────
 
 /// Root OpenAPI document generated from all annotated schemas and paths.
@@ -452,6 +488,9 @@ See the cNGN Integration Guide in `/docs/cngn/` for setup instructions.
         ScopesListResponse,
         KeyScopesResponse,
         UpdateScopesRequest,
+        TransparencyResponseSchema,
+        ReserveDataPointSchema,
+        TransparencyHistorySchema,
     )),
     tags(
         (name = "onramp", description = "NGN to cNGN conversion (fiat to crypto)"),
@@ -461,6 +500,7 @@ See the cNGN Integration Guide in `/docs/cngn/` for setup instructions.
         (name = "wallet", description = "Wallet balance and trustline management"),
         (name = "batch", description = "Batch transaction processing"),
         (name = "admin", description = "Administrative endpoints — require admin authentication"),
+        (name = "transparency", description = "Public Proof-of-Reserves data feed for aggregators"),
     ),
     modifiers(&SecurityAddon),
     servers(

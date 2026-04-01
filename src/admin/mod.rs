@@ -8,6 +8,11 @@ pub mod auth;
 pub mod observability;
 pub mod routes;
 pub mod tests;
+pub mod transaction_models;
+pub mod transaction_repository;
+pub mod transaction_service;
+pub mod transaction_handlers;
+pub mod transaction_tests;
 
 pub use models::*;
 pub use repositories::*;
@@ -18,3 +23,11 @@ pub use handlers::*;
 pub use auth::*;
 pub use observability::*;
 pub use routes::*;
+
+pub mod mint_signer_models;
+pub mod mint_signer_repository;
+pub mod mint_signer_service;
+pub mod mint_signer_metrics;
+pub mod mint_signer_handlers;
+pub mod mint_signer_routes;
+pub mod mint_signer_tests;

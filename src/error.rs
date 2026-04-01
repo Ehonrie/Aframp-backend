@@ -2,7 +2,6 @@
 //!
 //! This module provides a unified error system with proper HTTP status mapping,
 //! user-friendly messages, and structured error codes for client handling.
-
 #[cfg(feature = "database")]
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -43,6 +42,10 @@ pub enum ErrorCode {
     InvalidWallet,
     #[serde(rename = "DUPLICATE_TRANSACTION")]
     DuplicateTransaction,
+    #[serde(rename = "RESERVE_INSUFFICIENT")]
+    ReserveInsufficient,
+    #[serde(rename = "MINT_DISABLED")]
+    MintDisabled,
 
     // Infrastructure errors (5xx)
     #[serde(rename = "DATABASE_ERROR")]
@@ -101,6 +104,15 @@ pub enum DomainError {
     InsufficientLiquidity { amount: String },
     /// Access forbidden (e.g., transaction doesn't belong to requesting wallet)
     Forbidden { message: String },
+    /// Fiat reserves are insufficient to back the requested mint amount (CBN/ASC compliance)
+    ReserveInsufficient {
+        total_reserves: String,
+        total_supply: String,
+        mint_amount: String,
+        ratio: String,
+    },
+    /// Minting is disabled by the circuit breaker
+    MintDisabled,
 }
 
 /// Infrastructure-level errors (database, cache, configuration)
@@ -215,6 +227,9 @@ impl AppError {
                 DomainError::DuplicateTransaction { .. } => 409, // Conflict
                 DomainError::TrustlineCreationFailed { .. } => 422,
                 DomainError::InsufficientLiquidity { .. } => 409, // Conflict
+                DomainError::ReserveInsufficient { .. } => 422,
+                DomainError::MintDisabled => 503,
+                _ => 422,
             },
             AppErrorKind::Infrastructure(err) => match err {
                 InfrastructureError::Database { .. } => 500,
@@ -251,6 +266,9 @@ impl AppError {
                 DomainError::TrustlineCreationFailed { .. } => ErrorCode::TrustlineCreationFailed,
                 DomainError::InsufficientLiquidity { .. } => ErrorCode::InsufficientLiquidity,
                 DomainError::AmountTooLow { .. } => ErrorCode::AmountTooLow,
+                DomainError::ReserveInsufficient { .. } => ErrorCode::ReserveInsufficient,
+                DomainError::MintDisabled => ErrorCode::MintDisabled,
+                _ => ErrorCode::InternalError,
             },
             AppErrorKind::Infrastructure(err) => match err {
                 InfrastructureError::Database { .. } => ErrorCode::DatabaseError,
@@ -327,6 +345,16 @@ impl AppError {
                 DomainError::AmountTooLow { .. } => {
                     "Minimum onramp amount is ₦1,000.".to_string()
                 }
+                DomainError::ReserveInsufficient { ratio, .. } => {
+                    format!(
+                        "Mint rejected: fiat reserve ratio ({}) is below the required 1:1 minimum.",
+                        ratio
+                    )
+                }
+                DomainError::MintDisabled => {
+                    "Minting is currently disabled due to a reserve compliance breach. Contact the treasury team.".to_string()
+                }
+                _ => "An unexpected error occurred.".to_string(),
             },
             AppErrorKind::Infrastructure(_) => {
                 "Service temporarily unavailable. Please try again later".to_string()
@@ -505,6 +533,73 @@ impl From<StellarError> for AppError {
 /// Result type for operations that can fail with AppError
 #[cfg(feature = "database")]
 pub type AppResult<T> = Result<T, AppError>;
+
+/// Simple error type used by admin module handlers and middleware.
+/// Maps directly to HTTP status codes via IntoResponse.
+#[cfg(feature = "database")]
+#[derive(Debug, Clone)]
+pub enum Error {
+    /// 401 Unauthenticated
+    Authentication(String),
+    /// 403 Forbidden
+    Forbidden(String),
+    /// 404 Not Found
+    NotFound(String),
+    /// 400 Bad Request
+    BadRequest(String),
+    /// 409 Conflict
+    Conflict(String),
+    /// 429 Too Many Requests
+    TooManyRequests(String),
+    /// 500 Internal Server Error
+    Internal(String),
+}
+
+#[cfg(feature = "database")]
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Authentication(m) => write!(f, "Authentication error: {}", m),
+            Error::Forbidden(m) => write!(f, "Forbidden: {}", m),
+            Error::NotFound(m) => write!(f, "Not found: {}", m),
+            Error::BadRequest(m) => write!(f, "Bad request: {}", m),
+            Error::Conflict(m) => write!(f, "Conflict: {}", m),
+            Error::TooManyRequests(m) => write!(f, "Too many requests: {}", m),
+            Error::Internal(m) => write!(f, "Internal error: {}", m),
+        }
+    }
+}
+
+#[cfg(feature = "database")]
+impl std::error::Error for Error {}
+
+#[cfg(feature = "database")]
+impl axum::response::IntoResponse for Error {
+    fn into_response(self) -> axum::response::Response {
+        use axum::http::StatusCode;
+        use axum::Json;
+        use serde_json::json;
+
+        let (status, message) = match &self {
+            Error::Authentication(m) => (StatusCode::UNAUTHORIZED, m.clone()),
+            Error::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
+            Error::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
+            Error::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
+            Error::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
+            Error::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m.clone()),
+            Error::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.clone()),
+        };
+
+        (status, Json(json!({ "error": message }))).into_response()
+    }
+}
+
+#[cfg(feature = "database")]
+impl From<crate::database::error::DatabaseError> for Error {
+    fn from(e: crate::database::error::DatabaseError) -> Self {
+        Error::Internal(e.to_string())
+    }
+}
 
 #[cfg(all(test, feature = "database"))]
 mod tests {

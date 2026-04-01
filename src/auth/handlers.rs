@@ -68,6 +68,12 @@ pub struct RevokeTokenRequest {
     pub access_token: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RevokeRequest {
+    pub token: Option<String>,
+    #[serde(default)]
+    pub revoke_all: bool,
+}
 
 #[derive(Debug, Serialize)]
 pub struct RevokeResponse {
@@ -362,3 +368,4 @@ fn jwt_error_response(err: JwtError) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+}
