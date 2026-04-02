@@ -6,27 +6,23 @@
 //! - Creates pending withdrawal transactions
 //! - Provides payment instructions for sending cNGN to system wallet
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    Json,
-};
+use axum::{ extract::State, http::StatusCode, response::{ IntoResponse, Response }, Json };
 use bigdecimal::BigDecimal;
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::{ Deserialize, Serialize };
 use serde_json::json;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{ debug, error, info, warn };
 use uuid::Uuid;
 
 use crate::cache::cache::Cache;
 use crate::cache::keys::onramp::QuoteKey;
 use crate::cache::RedisCache;
 use crate::database::transaction_repository::TransactionRepository;
-use crate::error::{AppError, AppErrorKind, DomainError, ValidationError};
+use crate::error::{ AppError, AppErrorKind, DomainError, ValidationError };
 use crate::payments::factory::PaymentProviderFactory;
+use crate::security::{ CircuitBreakerMiddleware, AnomalyDetectionService };
 use crate::services::bank_verification::BankVerificationService;
 use crate::services::onramp_quote::StoredQuote;
 use sqlx::PgPool;
@@ -44,9 +40,9 @@ pub struct OfframpInitiateRequest {
 /// Bank account details for withdrawal
 #[derive(Debug, Clone, Deserialize)]
 pub struct BankDetails {
-    pub bank_code: String,       // 3-digit Nigerian bank code
-    pub account_number: String,  // 10-digit account number
-    pub account_name: String,    // Account holder name
+    pub bank_code: String, // 3-digit Nigerian bank code
+    pub account_number: String, // 10-digit account number
+    pub account_name: String, // Account holder name
 }
 
 /// Bank account verification result
@@ -151,6 +147,7 @@ pub struct OfframpState {
     pub bank_verification_service: Arc<BankVerificationService>,
     pub system_wallet_address: String,
     pub cngn_issuer_address: String,
+    pub circuit_breaker: Arc<CircuitBreakerMiddleware>,
 }
 
 // ===== CONSTANTS =====
@@ -200,14 +197,16 @@ fn validate_bank_code(bank_code: &str) -> Result<String, AppError> {
         .get(bank_code)
         .cloned()
         .ok_or_else(|| {
-            AppError::new(AppErrorKind::Validation(ValidationError::InvalidAmount {
-                amount: bank_code.to_string(),
-                reason: format!(
-                    "Bank code '{}' is not supported. Supported codes: {}",
-                    bank_code,
-                    banks.keys().cloned().collect::<Vec<_>>().join(", ")
-                ),
-            }))
+            AppError::new(
+                AppErrorKind::Validation(ValidationError::InvalidAmount {
+                    amount: bank_code.to_string(),
+                    reason: format!(
+                        "Bank code '{}' is not supported. Supported codes: {}",
+                        bank_code,
+                        banks.keys().cloned().collect::<Vec<_>>().join(", ")
+                    ),
+                })
+            )
         })
 }
 
@@ -215,12 +214,14 @@ fn validate_bank_code(bank_code: &str) -> Result<String, AppError> {
 fn validate_account_number(account_number: &str) -> Result<(), AppError> {
     let trimmed = account_number.trim();
     if trimmed.len() != 10 || !trimmed.chars().all(|c| c.is_ascii_digit()) {
-        return Err(AppError::new(AppErrorKind::Validation(
-            ValidationError::InvalidAmount {
-                amount: account_number.to_string(),
-                reason: "Account number must be exactly 10 digits".to_string(),
-            },
-        )));
+        return Err(
+            AppError::new(
+                AppErrorKind::Validation(ValidationError::InvalidAmount {
+                    amount: account_number.to_string(),
+                    reason: "Account number must be exactly 10 digits".to_string(),
+                })
+            )
+        );
     }
     Ok(())
 }
@@ -229,19 +230,23 @@ fn validate_account_number(account_number: &str) -> Result<(), AppError> {
 fn validate_account_name(account_name: &str) -> Result<(), AppError> {
     let trimmed = account_name.trim();
     if trimmed.is_empty() {
-        return Err(AppError::new(AppErrorKind::Validation(
-            ValidationError::MissingField {
-                field: "account_name".to_string(),
-            },
-        )));
+        return Err(
+            AppError::new(
+                AppErrorKind::Validation(ValidationError::MissingField {
+                    field: "account_name".to_string(),
+                })
+            )
+        );
     }
     if trimmed.len() > 200 {
-        return Err(AppError::new(AppErrorKind::Validation(
-            ValidationError::InvalidAmount {
-                amount: account_name.to_string(),
-                reason: "Account name is too long (max 200 characters)".to_string(),
-            },
-        )));
+        return Err(
+            AppError::new(
+                AppErrorKind::Validation(ValidationError::InvalidAmount {
+                    amount: account_name.to_string(),
+                    reason: "Account name is too long (max 200 characters)".to_string(),
+                })
+            )
+        );
     }
     Ok(())
 }
@@ -275,28 +280,30 @@ fn generate_withdrawal_memo(transaction_id: &Uuid) -> String {
 async fn validate_quote(
     redis_cache: &RedisCache,
     quote_id: &str,
-    wallet_address: &str,
+    wallet_address: &str
 ) -> Result<StoredQuote, AppError> {
     let cache_key = QuoteKey::new(quote_id).to_string();
 
     // Fetch quote from cache with explicit type annotation
     let cached_result: Result<Option<StoredQuote>, _> = redis_cache.get(&cache_key).await;
-    
+
     let stored_quote = cached_result
         .map_err(|e| {
             error!(quote_id = %quote_id, error = %e, "Failed to fetch quote from Redis");
-            AppError::new(AppErrorKind::Infrastructure(
-                crate::error::InfrastructureError::Cache {
+            AppError::new(
+                AppErrorKind::Infrastructure(crate::error::InfrastructureError::Cache {
                     message: format!("Failed to retrieve quote: {}", e),
-                },
-            ))
+                })
+            )
         })?
         .ok_or_else(|| {
             info!(quote_id = %quote_id, "Quote not found");
-            AppError::new(AppErrorKind::Validation(ValidationError::InvalidAmount {
-                amount: quote_id.to_string(),
-                reason: "Invalid quote ID. Please generate a new quote.".to_string(),
-            }))
+            AppError::new(
+                AppErrorKind::Validation(ValidationError::InvalidAmount {
+                    amount: quote_id.to_string(),
+                    reason: "Invalid quote ID. Please generate a new quote.".to_string(),
+                })
+            )
         })?;
 
     // Check if quote has expired
@@ -304,21 +311,27 @@ async fn validate_quote(
         let expires_utc = expires_dt.with_timezone(&Utc);
         if expires_utc < Utc::now() {
             info!(quote_id = %quote_id, "Quote has expired");
-            return Err(AppError::new(AppErrorKind::Domain(
-                DomainError::RateExpired {
-                    quote_id: quote_id.to_string(),
-                },
-            )));
+            return Err(
+                AppError::new(
+                    AppErrorKind::Domain(DomainError::RateExpired {
+                        quote_id: quote_id.to_string(),
+                    })
+                )
+            );
         }
     }
 
     // Check if quote status is pending (not already used)
     if stored_quote.status != "pending" {
         info!(quote_id = %quote_id, status = %stored_quote.status, "Quote already used");
-        return Err(AppError::new(AppErrorKind::Validation(ValidationError::InvalidAmount {
-            amount: quote_id.to_string(),
-            reason: "This quote has already been used for a withdrawal".to_string(),
-        })));
+        return Err(
+            AppError::new(
+                AppErrorKind::Validation(ValidationError::InvalidAmount {
+                    amount: quote_id.to_string(),
+                    reason: "This quote has already been used for a withdrawal".to_string(),
+                })
+            )
+        );
     }
 
     // Verify wallet address matches
@@ -329,12 +342,14 @@ async fn validate_quote(
             provided_wallet = %wallet_address,
             "Wallet address mismatch"
         );
-        return Err(AppError::new(AppErrorKind::Validation(
-            ValidationError::InvalidWalletAddress {
-                address: wallet_address.to_string(),
-                reason: "Quote was generated for a different wallet.".to_string(),
-            },
-        )));
+        return Err(
+            AppError::new(
+                AppErrorKind::Validation(ValidationError::InvalidWalletAddress {
+                    address: wallet_address.to_string(),
+                    reason: "Quote was generated for a different wallet.".to_string(),
+                })
+            )
+        );
     }
 
     debug!(quote_id = %quote_id, "Quote validated successfully");
@@ -348,7 +363,7 @@ async fn verify_bank_account(
     service: &BankVerificationService,
     bank_code: &str,
     account_number: &str,
-    account_name: &str,
+    account_name: &str
 ) -> Result<VerifiedBankDetails, AppError> {
     // Validate format first
     validate_account_number(account_number)?;
@@ -356,9 +371,11 @@ async fn verify_bank_account(
     validate_account_name(account_name)?;
 
     // Call payment provider API to verify account
-    let verification_result = service
-        .verify_account(bank_code, account_number, account_name)
-        .await?;
+    let verification_result = service.verify_account(
+        bank_code,
+        account_number,
+        account_name
+    ).await?;
 
     info!(
         bank_code = %bank_code,
@@ -384,11 +401,12 @@ async fn create_withdrawal_transaction(
     quote: &StoredQuote,
     bank_details: &VerifiedBankDetails,
     memo: &str,
-    expires_at: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>
 ) -> Result<(String, String), AppError> {
     let tx_repo = TransactionRepository::new(db_pool.clone());
 
-    let metadata = json!({
+    let metadata =
+        json!({
         "quote_id": quote.quote_id,
         "payment_memo": memo,
         "bank_code": bank_details.bank_code,
@@ -399,8 +417,9 @@ async fn create_withdrawal_transaction(
         "expires_at": expires_at.to_rfc3339(),
     });
 
-    let cngn_amount = BigDecimal::from_str(&quote.amount_cngn)
-        .unwrap_or_else(|_| BigDecimal::from(0));
+    let cngn_amount = BigDecimal::from_str(&quote.amount_cngn).unwrap_or_else(|_|
+        BigDecimal::from(0)
+    );
     let ngn_amount_parsed = quote.amount_ngn;
 
     let tx = tx_repo
@@ -415,17 +434,16 @@ async fn create_withdrawal_transaction(
             "pending_payment",
             None,
             Some(memo),
-            metadata,
-        )
-        .await
+            metadata
+        ).await
         .map_err(|e| {
             error!(error = ?e, "Failed to create withdrawal transaction");
-            AppError::new(AppErrorKind::Infrastructure(
-                crate::error::InfrastructureError::Database {
+            AppError::new(
+                AppErrorKind::Infrastructure(crate::error::InfrastructureError::Database {
                     message: format!("Failed to create transaction: {}", e),
                     is_retryable: false,
-                },
-            ))
+                })
+            )
         })?;
 
     let tx_id = tx.transaction_id.to_string();
@@ -446,8 +464,18 @@ async fn create_withdrawal_transaction(
 /// 5. Returning system wallet address and payment instructions
 pub async fn initiate_withdrawal(
     State(state): State<Arc<OfframpState>>,
-    Json(request): Json<OfframpInitiateRequest>,
+    Json(request): Json<OfframpInitiateRequest>
 ) -> Response {
+    // Check circuit breaker status before proceeding
+    if let Err(e) = state.circuit_breaker.check_operation_allowed().await {
+        return create_error_response(
+            503,
+            "SYSTEM_HALTED",
+            "System temporarily unavailable due to security incident".to_string(),
+            None
+        );
+    }
+
     info!(
         quote_id = %request.quote_id,
         wallet = %request.wallet_address,
@@ -455,22 +483,28 @@ pub async fn initiate_withdrawal(
     );
 
     // 1. Validate quote
-    let quote = match validate_quote(&state.redis_cache, &request.quote_id, &request.wallet_address).await {
+    let quote = match
+        validate_quote(&state.redis_cache, &request.quote_id, &request.wallet_address).await
+    {
         Ok(q) => q,
-        Err(e) => return handle_offramp_error(e),
+        Err(e) => {
+            return handle_offramp_error(e);
+        }
     };
 
     // 2. Verify bank details
-    let verified_bank = match verify_bank_account(
-        &state.bank_verification_service,
-        &request.bank_details.bank_code,
-        &request.bank_details.account_number,
-        &request.bank_details.account_name,
-    )
-    .await
+    let verified_bank = match
+        verify_bank_account(
+            &state.bank_verification_service,
+            &request.bank_details.bank_code,
+            &request.bank_details.account_number,
+            &request.bank_details.account_name
+        ).await
     {
         Ok(b) => b,
-        Err(e) => return handle_offramp_error(e),
+        Err(e) => {
+            return handle_offramp_error(e);
+        }
     };
 
     // 3. Generate unique memo
@@ -480,18 +514,20 @@ pub async fn initiate_withdrawal(
     // 4. Create transaction in database
     let expires_at = Utc::now() + chrono::Duration::seconds(WITHDRAWAL_EXPIRY_SECS);
 
-    let (tx_id, _) = match create_withdrawal_transaction(
-        &state.db_pool,
-        &request.wallet_address,
-        &quote,
-        &verified_bank,
-        &memo,
-        expires_at,
-    )
-    .await
+    let (tx_id, _) = match
+        create_withdrawal_transaction(
+            &state.db_pool,
+            &request.wallet_address,
+            &quote,
+            &verified_bank,
+            &memo,
+            expires_at
+        ).await
     {
         Ok((id, m)) => (id, m),
-        Err(e) => return handle_offramp_error(e),
+        Err(e) => {
+            return handle_offramp_error(e);
+        }
     };
 
     // 5. Mark quote as used in Redis
@@ -499,10 +535,12 @@ pub async fn initiate_withdrawal(
     let mut updated_quote = quote.clone();
     updated_quote.status = "consumed".to_string();
 
-    if let Err(e) = state
-        .redis_cache
-        .set(&cache_key, &updated_quote, Some(std::time::Duration::from_secs(300)))
-        .await
+    if
+        let Err(e) = state.redis_cache.set(
+            &cache_key,
+            &updated_quote,
+            Some(std::time::Duration::from_secs(300))
+        ).await
     {
         error!(error = %e, "Failed to update quote status in Redis");
         // Continue anyway, as the transaction is already created
@@ -551,7 +589,7 @@ pub async fn initiate_withdrawal(
             format!("To address: {}", state.system_wallet_address),
             format!("Include memo: {} (REQUIRED)", memo),
             "Wait for confirmation".to_string(),
-            format!("NGN will be sent to your bank account ({})", verified_bank.account_number),
+            format!("NGN will be sent to your bank account ({})", verified_bank.account_number)
         ],
         created_at: now.to_rfc3339(),
     };
@@ -586,11 +624,7 @@ fn handle_offramp_error(error: AppError) -> Response {
                         provided_name: None,
                         actual_name: None,
                     };
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse { error: detail }),
-                    )
-                        .into_response()
+                    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: detail })).into_response()
                 }
                 InvalidAmount { amount, reason } => {
                     match amount.parse::<u32>() {
@@ -609,8 +643,7 @@ fn handle_offramp_error(error: AppError) -> Response {
                             (
                                 StatusCode::BAD_REQUEST,
                                 Json(ErrorResponse { error: detail }),
-                            )
-                                .into_response()
+                            ).into_response()
                         }
                         Err(_) => {
                             // Invalid account number or quote ID
@@ -635,8 +668,7 @@ fn handle_offramp_error(error: AppError) -> Response {
                             (
                                 StatusCode::BAD_REQUEST,
                                 Json(ErrorResponse { error: detail }),
-                            )
-                                .into_response()
+                            ).into_response()
                         }
                     }
                 }
@@ -651,11 +683,7 @@ fn handle_offramp_error(error: AppError) -> Response {
                         provided_name: None,
                         actual_name: None,
                     };
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse { error: detail }),
-                    )
-                        .into_response()
+                    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: detail })).into_response()
                 }
                 _ => {
                     let detail = ErrorResponseDetail {
@@ -668,11 +696,7 @@ fn handle_offramp_error(error: AppError) -> Response {
                         provided_name: None,
                         actual_name: None,
                     };
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse { error: detail }),
-                    )
-                        .into_response()
+                    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: detail })).into_response()
                 }
             }
         }
@@ -690,11 +714,7 @@ fn handle_offramp_error(error: AppError) -> Response {
                         provided_name: None,
                         actual_name: None,
                     };
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse { error: detail }),
-                    )
-                        .into_response()
+                    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: detail })).into_response()
                 }
                 _ => {
                     let detail = ErrorResponseDetail {
@@ -707,11 +727,7 @@ fn handle_offramp_error(error: AppError) -> Response {
                         provided_name: None,
                         actual_name: None,
                     };
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse { error: detail }),
-                    )
-                        .into_response()
+                    (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: detail })).into_response()
                 }
             }
         }
@@ -727,20 +743,25 @@ fn handle_offramp_error(error: AppError) -> Response {
                 provided_name: None,
                 actual_name: None,
             };
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse { error: detail }),
-            )
-                .into_response()
+            (StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: detail })).into_response()
         }
         External(ee) => {
             use crate::error::ExternalError::*;
             error!(error = ?ee, "External service error in offramp initiate");
             match ee {
                 PaymentProvider { provider, message, is_retryable } => {
-                    let (code, msg): (&str, String) = if message.contains("not found") || message.contains("Account not found") {
-                        ("INVALID_BANK_ACCOUNT", "Bank account not found. Please verify account number and bank code.".to_string())
-                    } else if message.contains("name mismatch") || message.contains("Name mismatch") {
+                    let (code, msg): (&str, String) = if
+                        message.contains("not found") ||
+                        message.contains("Account not found")
+                    {
+                        (
+                            "INVALID_BANK_ACCOUNT",
+                            "Bank account not found. Please verify account number and bank code.".to_string(),
+                        )
+                    } else if
+                        message.contains("name mismatch") ||
+                        message.contains("Name mismatch")
+                    {
                         ("ACCOUNT_NAME_MISMATCH", message.clone())
                     } else {
                         ("BANK_VERIFICATION_FAILED", "Bank account verification failed".to_string())
@@ -767,7 +788,11 @@ fn handle_offramp_error(error: AppError) -> Response {
                 Timeout { service, timeout_secs } => {
                     let detail = ErrorResponseDetail {
                         code: "VERIFICATION_TIMEOUT".to_string(),
-                        message: format!("{} verification timed out after {} seconds", service, timeout_secs),
+                        message: format!(
+                            "{} verification timed out after {} seconds",
+                            service,
+                            timeout_secs
+                        ),
                         details: Some("Please try again".to_string()),
                         quote_id: None,
                         bank_code: None,
@@ -778,14 +803,15 @@ fn handle_offramp_error(error: AppError) -> Response {
                     (
                         StatusCode::GATEWAY_TIMEOUT,
                         Json(ErrorResponse { error: detail }),
-                    )
-                        .into_response()
+                    ).into_response()
                 }
                 _ => {
                     let detail = ErrorResponseDetail {
                         code: "VERIFICATION_SERVICE_UNAVAILABLE".to_string(),
                         message: "Unable to verify bank account at this time".to_string(),
-                        details: Some("Bank verification service is temporarily unavailable".to_string()),
+                        details: Some(
+                            "Bank verification service is temporarily unavailable".to_string()
+                        ),
                         quote_id: None,
                         bank_code: None,
                         account_number: None,
@@ -795,8 +821,7 @@ fn handle_offramp_error(error: AppError) -> Response {
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(ErrorResponse { error: detail }),
-                    )
-                        .into_response()
+                    ).into_response()
                 }
             }
         }
@@ -844,31 +869,34 @@ mod tests {
     fn test_generate_withdrawal_memo() {
         let uuid = Uuid::new_v4();
         let memo = generate_withdrawal_memo(&uuid);
-        
+
         // Check format: WD-{8_chars}
         assert!(memo.starts_with("WD-"), "Memo should start with WD-");
         assert_eq!(memo.len(), 11, "Memo should be 11 characters (WD- + 8 UUID chars)");
-        
+
         // Check it's ASCII and within Stellar memo limit
         assert!(memo.is_ascii(), "Memo should be ASCII");
         assert!(memo.len() <= 28, "Memo should be under Stellar 28-byte limit");
-        
+
         // Check format is uppercase
         assert_eq!(memo, memo.to_uppercase(), "Memo should be uppercase");
-        
+
         // Check all characters after WD- are hex digits
         let hex_part = &memo[3..];
-        assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()), "Characters after WD- should be hex digits");
+        assert!(
+            hex_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "Characters after WD- should be hex digits"
+        );
     }
 
     #[test]
     fn test_memo_uniqueness() {
         let uuid1 = Uuid::new_v4();
         let uuid2 = Uuid::new_v4();
-        
+
         let memo1 = generate_withdrawal_memo(&uuid1);
         let memo2 = generate_withdrawal_memo(&uuid2);
-        
+
         // Memos should be different (with extremely high probability)
         assert_ne!(memo1, memo2, "Different UUIDs should generate different memos");
     }
@@ -877,11 +905,11 @@ mod tests {
     fn test_memo_reproducibility() {
         let uuid = uuid::Uuid::parse_str("9f8e7d6c-5b4a-1234-a5b6-c7d8e9f0a1b2").unwrap();
         let memo = generate_withdrawal_memo(&uuid);
-        
+
         // Should produce consistent output
         let memo2 = generate_withdrawal_memo(&uuid);
         assert_eq!(memo, memo2, "Same UUID should produce same memo");
-        
+
         // Check expected format
         assert_eq!(&memo[0..3], "WD-", "Should start with WD-");
         assert_eq!(memo.len(), 11, "Should be 11 characters total");

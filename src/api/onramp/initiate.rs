@@ -6,18 +6,24 @@ use crate::chains::stellar::trustline::CngnTrustlineManager;
 use crate::chains::stellar::types::is_valid_stellar_address;
 use crate::database::repository::Repository;
 use crate::database::transaction_repository::TransactionRepository;
-use crate::error::{AppError, AppErrorKind, DomainError, ExternalError, InfrastructureError, ValidationError};
-use crate::services::onramp_quote::StoredQuote;
-use crate::services::payment_orchestrator::{
-    PaymentInitiationRequest, PaymentOrchestrator,
+use crate::error::{
+    AppError,
+    AppErrorKind,
+    DomainError,
+    ExternalError,
+    InfrastructureError,
+    ValidationError,
 };
+use crate::security::{ CircuitBreakerMiddleware, AnomalyDetectionService };
+use crate::services::onramp_quote::StoredQuote;
+use crate::services::payment_orchestrator::{ PaymentInitiationRequest, PaymentOrchestrator };
 use crate::payments::types::PaymentMethod;
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{ extract::State, http::StatusCode, response::IntoResponse, Json };
 use bigdecimal::BigDecimal;
-use serde::{Deserialize, Serialize};
+use serde::{ Deserialize, Serialize };
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{ error, info, warn };
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -28,6 +34,8 @@ pub struct OnrampInitiateState {
     pub stellar_client: Arc<StellarClient>,
     pub orchestrator: Arc<PaymentOrchestrator>,
     pub cngn_issuer: String,
+    pub circuit_breaker: Arc<CircuitBreakerMiddleware>,
+    pub anomaly_service: Arc<AnomalyDetectionService>,
 }
 
 // ── Request / Response ────────────────────────────────────────────────────────
@@ -72,21 +80,29 @@ pub struct QuoteSummary {
 /// POST /api/onramp/initiate
 pub async fn initiate_onramp(
     State(state): State<Arc<OnrampInitiateState>>,
-    Json(req): Json<InitiateOnrampRequest>,
+    Json(req): Json<InitiateOnrampRequest>
 ) -> Result<impl IntoResponse, AppError> {
+    // Check circuit breaker status before proceeding
+    state.circuit_breaker.check_operation_allowed().await?;
     // 1. Basic input validation
     if req.quote_id.trim().is_empty() {
-        return Err(AppError::new(AppErrorKind::Validation(
-            ValidationError::MissingField { field: "quote_id".to_string() },
-        )));
+        return Err(
+            AppError::new(
+                AppErrorKind::Validation(ValidationError::MissingField {
+                    field: "quote_id".to_string(),
+                })
+            )
+        );
     }
     if !is_valid_stellar_address(&req.wallet_address) {
-        return Err(AppError::new(AppErrorKind::Validation(
-            ValidationError::InvalidWalletAddress {
-                address: req.wallet_address.clone(),
-                reason: "Not a valid Stellar public key".to_string(),
-            },
-        )));
+        return Err(
+            AppError::new(
+                AppErrorKind::Validation(ValidationError::InvalidWalletAddress {
+                    address: req.wallet_address.clone(),
+                    reason: "Not a valid Stellar public key".to_string(),
+                })
+            )
+        );
     }
 
     // 2. Fetch quote from Redis
@@ -94,108 +110,116 @@ pub async fn initiate_onramp(
     let quote: StoredQuote = {
         let cache: &dyn Cache<StoredQuote> = &*state.cache;
         cache
-            .get(&quote_key)
-            .await
+            .get(&quote_key).await
             .map_err(|e| {
                 error!(error = %e, "Cache error fetching quote");
-                AppError::new(AppErrorKind::Infrastructure(InfrastructureError::Cache {
-                    message: "Failed to fetch quote".to_string(),
-                }))
+                AppError::new(
+                    AppErrorKind::Infrastructure(InfrastructureError::Cache {
+                        message: "Failed to fetch quote".to_string(),
+                    })
+                )
             })?
             .ok_or_else(|| {
-                AppError::new(AppErrorKind::Domain(DomainError::RateExpired {
-                    quote_id: req.quote_id.clone(),
-                }))
+                AppError::new(
+                    AppErrorKind::Domain(DomainError::RateExpired {
+                        quote_id: req.quote_id.clone(),
+                    })
+                )
             })?
     };
 
     // 3. Validate quote belongs to this wallet
     if quote.wallet_address != req.wallet_address {
-        return Err(AppError::new(AppErrorKind::Validation(
-            ValidationError::InvalidWalletAddress {
-                address: req.wallet_address.clone(),
-                reason: "Wallet address does not match quote".to_string(),
-            },
-        )));
+        return Err(
+            AppError::new(
+                AppErrorKind::Validation(ValidationError::InvalidWalletAddress {
+                    address: req.wallet_address.clone(),
+                    reason: "Wallet address does not match quote".to_string(),
+                })
+            )
+        );
     }
 
     // 4. Verify trustline
     let trustline_manager = CngnTrustlineManager::new((*state.stellar_client).clone());
     let trustline_status = trustline_manager
-        .check_trustline(&req.wallet_address)
-        .await
+        .check_trustline(&req.wallet_address).await
         .map_err(|e| AppError::from(e))?;
 
     if !trustline_status.has_trustline {
-        return Err(AppError::new(AppErrorKind::Domain(
-            DomainError::TrustlineNotFound {
-                wallet_address: req.wallet_address.clone(),
-                asset: "cNGN".to_string(),
-            },
-        )));
+        return Err(
+            AppError::new(
+                AppErrorKind::Domain(DomainError::TrustlineNotFound {
+                    wallet_address: req.wallet_address.clone(),
+                    asset: "cNGN".to_string(),
+                })
+            )
+        );
     }
 
     // 5. Check minimum Stellar XLM balance (account must exist and have ≥ 1 XLM)
-    let account = state
-        .stellar_client
-        .get_account(&req.wallet_address)
-        .await
-        .map_err(|e| {
-            warn!(wallet = %req.wallet_address, error = %e, "Failed to fetch Stellar account");
-            AppError::new(AppErrorKind::Domain(DomainError::WalletNotFound {
+    let account = state.stellar_client.get_account(&req.wallet_address).await.map_err(|e| {
+        warn!(wallet = %req.wallet_address, error = %e, "Failed to fetch Stellar account");
+        AppError::new(
+            AppErrorKind::Domain(DomainError::WalletNotFound {
                 wallet_address: req.wallet_address.clone(),
-            }))
-        })?;
+            })
+        )
+    })?;
 
-    let xlm_balance: f64 = account
-        .balances
+    let xlm_balance: f64 = account.balances
         .iter()
         .find(|b| b.asset_type == "native")
         .and_then(|b| b.balance.parse().ok())
         .unwrap_or(0.0);
 
     if xlm_balance < 1.0 {
-        return Err(AppError::new(AppErrorKind::Domain(
-            DomainError::InsufficientBalance {
-                available: xlm_balance.to_string(),
-                required: "1.0 XLM".to_string(),
-            },
-        )));
+        return Err(
+            AppError::new(
+                AppErrorKind::Domain(DomainError::InsufficientBalance {
+                    available: xlm_balance.to_string(),
+                    required: "1.0 XLM".to_string(),
+                })
+            )
+        );
     }
 
     // 6. Idempotency — derive key from client-supplied or wallet+quote
-    let idempotency_key = req
-        .idempotency_key
+    let idempotency_key = req.idempotency_key
         .clone()
         .unwrap_or_else(|| format!("onramp:{}:{}", req.wallet_address, req.quote_id));
 
     let idem_cache_key = format!("idempotency:{}", idempotency_key);
 
-    if let Ok(Some(existing_tx_id)) = {
-        let cache: &dyn Cache<String> = &*state.cache;
-        cache.get(&idem_cache_key).await
-    } {
+    if
+        let Ok(Some(existing_tx_id)) = ({
+            let cache: &dyn Cache<String> = &*state.cache;
+            cache.get(&idem_cache_key).await
+        })
+    {
         info!(
             idempotency_key = %idempotency_key,
             transaction_id = %existing_tx_id,
             "Duplicate request — returning existing transaction"
         );
         // Fetch existing transaction and return same response
-        let tx = state
-            .transaction_repo
+        let tx = state.transaction_repo
             .as_ref()
-            .find_by_id(&existing_tx_id)
-            .await
+            .find_by_id(&existing_tx_id).await
             .map_err(|e| {
-                AppError::new(AppErrorKind::Infrastructure(InfrastructureError::Database {
-                    message: e.to_string(),
-                    is_retryable: true,
-                }))
+                AppError::new(
+                    AppErrorKind::Infrastructure(InfrastructureError::Database {
+                        message: e.to_string(),
+                        is_retryable: true,
+                    })
+                )
             })?
             .ok_or_else(|| {
-                AppError::new(AppErrorKind::Domain(DomainError::TransactionNotFound {
-                    transaction_id: existing_tx_id.clone(),
-                }))
+                AppError::new(
+                    AppErrorKind::Domain(DomainError::TransactionNotFound {
+                        transaction_id: existing_tx_id.clone(),
+                    })
+                )
             })?;
 
         return Ok((
@@ -205,7 +229,10 @@ pub async fn initiate_onramp(
                 status: tx.status.clone(),
                 payment_instructions: PaymentInstructions {
                     provider: tx.payment_provider.clone().unwrap_or_default(),
-                    payment_url: tx.metadata.get("payment_url").and_then(|v: &serde_json::Value| v.as_str()).map(String::from),
+                    payment_url: tx.metadata
+                        .get("payment_url")
+                        .and_then(|v: &serde_json::Value| v.as_str())
+                        .map(String::from),
                     provider_reference: tx.payment_reference.clone(),
                 },
                 quote_summary: QuoteSummary {
@@ -220,17 +247,19 @@ pub async fn initiate_onramp(
 
     // 7. Create pending transaction record BEFORE calling provider
     let amount_ngn = BigDecimal::from(quote.amount_ngn);
-    let amount_cngn = BigDecimal::from_str(&quote.amount_cngn).unwrap_or_else(|_| BigDecimal::from(0));
+    let amount_cngn = BigDecimal::from_str(&quote.amount_cngn).unwrap_or_else(|_|
+        BigDecimal::from(0)
+    );
 
-    let tx_metadata = serde_json::json!({
+    let tx_metadata =
+        serde_json::json!({
         "quote_id": quote.quote_id,
         "idempotency_key": idempotency_key,
         "rate_snapshot": quote.rate_snapshot,
         "chain": quote.chain,
     });
 
-    let transaction = state
-        .transaction_repo
+    let transaction = state.transaction_repo
         .create_transaction(
             &req.wallet_address,
             "onramp",
@@ -242,18 +271,31 @@ pub async fn initiate_onramp(
             "pending",
             Some(&req.payment_provider),
             None,
-            tx_metadata,
-        )
-        .await
+            tx_metadata
+        ).await
         .map_err(|e| {
             error!(error = %e, "Failed to create transaction record");
-            AppError::new(AppErrorKind::Infrastructure(InfrastructureError::Database {
-                message: e.to_string(),
-                is_retryable: true,
-            }))
+            AppError::new(
+                AppErrorKind::Infrastructure(InfrastructureError::Database {
+                    message: e.to_string(),
+                    is_retryable: true,
+                })
+            )
         })?;
 
     let tx_id = transaction.transaction_id.to_string();
+
+    // Record mint event for anomaly detection (velocity tracking)
+    if let Ok(amount_ngn_u64) = amount_ngn.to_string().parse::<u64>() {
+        if
+            let Err(e) = state.anomaly_service.record_mint_event(
+                amount_ngn_u64,
+                &req.wallet_address
+            ).await
+        {
+            warn!(error = %e, "Failed to record mint event for anomaly detection");
+        }
+    }
 
     // 8. Route through Payment Orchestration Service (#20)
     let initiation_req = PaymentInitiationRequest {
@@ -265,11 +307,13 @@ pub async fn initiate_onramp(
         customer_phone: req.customer_phone.clone(),
         callback_url: req.callback_url.clone(),
         idempotency_key: Some(idempotency_key.clone()),
-        metadata: Some(serde_json::json!({
+        metadata: Some(
+            serde_json::json!({
             "quote_id": quote.quote_id,
             "wallet_address": req.wallet_address,
             "transaction_id": tx_id,
-        })),
+        })
+        ),
     };
 
     let payment_response = match state.orchestrator.initiate_payment(initiation_req).await {
@@ -277,42 +321,41 @@ pub async fn initiate_onramp(
         Err(e) => {
             // Rollback: mark transaction as failed before returning error
             error!(tx_id = %tx_id, error = %e, "Orchestrator payment failed — rolling back");
-            let _ = state
-                .transaction_repo
-                .update_error(&tx_id, &e.to_string())
-                .await;
+            let _ = state.transaction_repo.update_error(&tx_id, &e.to_string()).await;
             return Err(AppError::from(e));
         }
     };
 
     // 9. Update transaction with provider reference and payment URL
-    let updated_metadata = serde_json::json!({
+    let updated_metadata =
+        serde_json::json!({
         "provider_reference": payment_response.provider_reference,
         "payment_url": payment_response.payment_url,
     });
-    let _ = state
-        .transaction_repo
-        .update_status_with_metadata(&tx_id, "pending", updated_metadata)
-        .await;
+    let _ = state.transaction_repo.update_status_with_metadata(
+        &tx_id,
+        "pending",
+        updated_metadata
+    ).await;
 
     // 10. Invalidate quote in Redis
-    if let Err(e) = {
-        let cache: &dyn Cache<StoredQuote> = &*state.cache;
-        cache.delete(&quote_key).await
-    } {
+    if
+        let Err(e) = ({
+            let cache: &dyn Cache<StoredQuote> = &*state.cache;
+            cache.delete(&quote_key).await
+        })
+    {
         warn!(quote_id = %req.quote_id, error = %e, "Failed to invalidate quote in Redis");
     }
 
     // 11. Store idempotency key (TTL: 24h)
     {
         let cache: &dyn Cache<String> = &*state.cache;
-        let _ = cache
-            .set(
-                &idem_cache_key,
-                &tx_id,
-                Some(std::time::Duration::from_secs(86400)),
-            )
-            .await;
+        let _ = cache.set(
+            &idem_cache_key,
+            &tx_id,
+            Some(std::time::Duration::from_secs(86400))
+        ).await;
     }
 
     // 12. Structured log
