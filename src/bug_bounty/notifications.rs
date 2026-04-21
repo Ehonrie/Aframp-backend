@@ -320,14 +320,19 @@ mod tests {
 
     #[test]
     fn disclosure_date_with_epoch_timestamp() {
-        let resolved_at = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        // Use Utc.timestamp_opt instead of the deprecated from_timestamp
+        let resolved_at = chrono::TimeZone::timestamp_opt(&Utc, 0, 0)
+            .single()
+            .expect("valid epoch timestamp");
         let disclosure = disclosure_date_after_resolution(resolved_at);
         assert!(disclosure > resolved_at);
     }
 
     #[test]
     fn disclosure_date_with_far_future_timestamp() {
-        let resolved_at = DateTime::<Utc>::from_timestamp(9_999_999_999, 0).unwrap();
+        let resolved_at = chrono::TimeZone::timestamp_opt(&Utc, 9_999_999_999, 0)
+            .single()
+            .expect("valid far-future timestamp");
         let disclosure = disclosure_date_after_resolution(resolved_at);
         assert!(disclosure > resolved_at);
     }

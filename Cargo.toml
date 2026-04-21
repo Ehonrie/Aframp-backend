@@ -269,6 +269,8 @@ required-features = ["database"]
 name = "liquidity_integration"
 path = "tests/liquidity_integration.rs"
 required-features = ["integration"]
+
+[[test]]
 name = "bug_bounty_integration"
 path = "tests/bug_bounty_integration.rs"
 required-features = ["database"]

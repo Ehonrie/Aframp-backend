@@ -53,7 +53,12 @@ pub fn evaluate_criteria(
     }
 
     // Criterion 4: stabilisation period elapsed
-    let elapsed_days = (Utc::now() - state.launched_at).num_days() as u64;
+    // Use saturating conversion: if launched_at is somehow in the future (clock skew),
+    // treat elapsed days as 0 rather than wrapping to a huge u64 value.
+    let elapsed_days = (Utc::now() - state.launched_at)
+        .num_days()
+        .try_into()
+        .unwrap_or(0u64);
     if elapsed_days < config.stabilisation_period_days {
         unmet.push(UnmetCriterion {
             criterion: "stabilisation_period_days".to_string(),

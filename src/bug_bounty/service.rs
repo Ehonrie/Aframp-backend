@@ -1,4 +1,5 @@
 use chrono::Utc;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -341,7 +342,8 @@ impl BugBountyService {
         );
 
         // 7. Update Prometheus metrics
-        let amount_f64 = reward.amount_usd.to_string().parse::<f64>().unwrap_or(0.0);
+        // Use rust_decimal's built-in conversion instead of going through String parsing.
+        let amount_f64 = reward.amount_usd.to_f64().unwrap_or(0.0);
         self.metrics.record_reward_issued(amount_f64);
 
         Ok(reward)
